@@ -269,13 +269,11 @@ This is worth fixing if the path is pursued: it is the only tool that would
 separate hardware time from framework overhead, including for the Core ML lane
 this would be compared against.
 
-## What is not measured
+## Boundary of the timing-only measurements
 
-Full-model numerics. The original layer and attribution timings use random
-weights and check no output, so none of them says a ported model would produce
-correct vectors. The follow-up score-matmul arms do check their complete outputs
-against a CPU reference, but a correctness gate against the existing model
-reference is still required before any full port is believed.
+The original layer and attribution timings use random weights and check no
+full-model output. The faithful full-model gate below supersedes that limitation;
+the earlier timing tables remain useful only as attribution measurements.
 
 Two historical arms in `layer_attribution` still report `execute failed`: four
 projections in one graph, and its original single dynamic matmul. Both build
@@ -287,3 +285,106 @@ terminal and a checked output.
 
 Everything here is one machine, one chip, one OS build. The private API is
 undocumented and can change without notice.
+
+## Faithful full-model correctness baseline — 2026-09-13
+
+`modernbert_full` now loads the real `Alibaba-NLP/gte-modernbert-base` checkpoint
+from snapshot `e7f32e3c00f91d699e8c43b53106206bcc72bb22`. The model digest is
+`3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba` and the
+config digest is
+`8ba54dc3d35d7194f5178a4194b649f146753e02dabd22bdca5c5cbac15069ed`.
+The snapshot location is always a command-line argument and is not embedded in
+the binary or evidence.
+
+The port runs all learned computation on the Neural Engine: embedding
+normalization, final normalization, and all 22 transformer layers. Token embedding lookup remains on
+the CPU because the binding has no gather operation; the resulting raw embedding
+tensor is the first Neural Engine input. Every projection and normalization
+weight is a compile-time graph constant. Transformer activations pass through a
+chain of fixed-shape IOSurfaces, with one layer per executable by default.
+Attention is query-tiled, preserves the complete key range for global layers and
+the exact bounded halo for local layers, and batches all 12 heads on the channel
+axis in each matrix multiplication.
+
+The checkpoint config says `classifier_pooling: mean`; that field controls the
+optional classification head and does not define embedding pooling. The model
+card's `transformers` example selects `last_hidden_state[:, 0]`, and its
+Transformers.js example explicitly requests `pooling: "cls", normalize: true`.
+The port therefore takes the first-token vector after final norm and L2-normalizes
+it, matching the existing fp32 reference.
+
+### Fixed rows and gate
+
+`bench/spikes/ane-direct-probe/rows.jsonl` contains four short real-text rows and
+four repeated-prose rows near each shape limit. The near-limit active lengths are
+448/480/500/511 at shape 512, 896/960/1000/1023 at shape 1024, and
+1792/1920/2000/2047 at shape 2048. Shape-indexed token IDs keep tokenization out
+of the binary while allowing the exact same committed row-set file to drive all
+three shapes. Its byte digest is
+`f4889a38df77b9940ce973c4d9b82857d0c401987ae8e77b5ca25e6062808c39`.
+
+The CPU comparator uses fp32 throughout, exact erf GELU, exact split-half RoPE,
+full permitted attention, the configured global-every-third schedule and local
+radius, pre-norm residual order, final norm, CLS pooling, and L2 normalization.
+The direct graph uses the binding's standard tanh GELU lowering because the op
+set has no erf. LayerNorm is algebraically rescaled by each token's largest
+centered channel before squaring; direct fp16 squaring overflowed at layer 12,
+whereas the rescaled expression remains the same normalization in exact
+arithmetic and produces finite outputs without a residual-stream rotation.
+
+| sequence | active-token range | min cosine | mean cosine | repeated vectors | gate |
+|---:|---:|---:|---:|---|---|
+| 512 | 12–511 | 0.9991073 | 0.9995399 | byte-identical | **pass** |
+| 1024 | 12–1023 | 0.9991632 | 0.9995657 | byte-identical | **pass — unexpected** |
+| 2048 | 12–2047 | 0.9990908 | 0.9995685 | byte-identical | **pass — unexpected** |
+
+The pre-declared 512 gate passes without Hadamard rotation. **The 1024 and 2048
+expected negatives also pass without rotation.** This is a material surprise,
+not a threshold change: the gate remains minimum cosine 0.999. Unlike the earlier
+Core ML graph, the direct graph uses the overflow-safe but algebraically equivalent
+LayerNorm formulation and crosses an fp16 IOSurface boundary after every layer.
+Those differences are plausible explanations, not an attribution claim.
+
+No shape failed its final-vector gate, so there is no failed-shape divergence
+point to report. The one-layer diagnostics did observe a transient 512 checkpoint
+minimum of 0.9989233 at layer 16 output before final vectors recovered to the
+accepted 0.9991073 minimum. At 1024 and 2048 every recorded layer-output minimum
+remained above 0.999.
+
+Run from the standalone workspace with:
+
+```sh
+cargo run --release --bin modernbert_full -- \
+  "$MODEL_SNAPSHOT" rows.jsonl --seq 512 --layers-per-executable 1 \
+  --warm-repetitions 5 --report "$REPORT_PATH"
+```
+
+Only `--seq` changes for the 1024 and 2048 runs. The same command accepts
+`--vectors-out` to write the normalized vectors separately.
+
+### Fusion and warm wall time
+
+After the one-layer 512 gate passed, a single two-layer-fusion control compiled,
+ran, passed with the same min/mean cosine, and emitted vectors identical to the
+one-layer arm. The median of the eight per-row warm medians was 31.62 ms with one
+layer per executable and 27.25 ms with two. Their one-minute load averages were
+19.30 and 17.35 respectively, so the difference is a campaign lead rather than a
+clean speedup claim.
+
+| sequence / fusion | median of row medians | row-median range | one-minute load |
+|---|---:|---:|---:|
+| 512 / 1 | 31.62 ms | 27.38–39.85 ms | 19.30 |
+| 512 / 2 | 27.25 ms | 26.44–30.10 ms | 17.35 |
+| 1024 / 1 | 103.89 ms | 89.97–113.61 ms | 10.88 |
+| 2048 / 1 | 213.35 ms | 171.39–301.27 ms | 10.96 |
+
+These are warm per-row wall-clock measurements. They include raw embedding
+gather, f32/fp16 IOSurface conversion, every private-API dispatch, output readback,
+and L2 normalization. The workstation was shared and busy; absolute values are
+ambient-contaminated and exist only to seed a later matched campaign baseline.
+
+**Baseline verdict: valid.** The direct-API port uses real checkpoint weights,
+passes the unchanged final-vector and determinism gates at every requested shape,
+and exposes one- or two-layer executable grouping without changing model math.
+Campaign experiments can optimize this implementation only while preserving the
+same gate and row-set digest.
