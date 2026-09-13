@@ -1,0 +1,23 @@
+// Curated evidence for the gte-modernbert direct Neural Engine campaign.
+// Patch targets stay on the candidate graph while the harness preserves the fp32
+// comparator, fixed rows, minimum cosine, and private-API compatibility probe.
+{
+  "harness": "gte-modernbert-ane-direct-embed",
+  "entries": [
+    // ---- Candidate graph construction ----
+    { "path": "bench/spikes/ane-direct-probe/src/bin/modernbert_full.rs", "ranges": [[376, 401], [403, 419], [437, 463], [483, 609], [657, 727]], "role": "patch_target" },
+
+    // ---- Per-layer attribution and the 53x batched-attention correction ----
+    { "path": "docs/evidence/ane-direct-api-m5/README.md", "ranges": [[47, 74]], "role": "doc" },
+
+    // ---- Closed attention negatives: operand baking, transposes, and head grouping ----
+    { "path": "docs/evidence/ane-direct-api-m5/README.md", "ranges": [[83, 189]], "role": "doc" },
+
+    // ---- Leading question: sequence scaling, plus the bounded fusion lead ----
+    { "path": "docs/evidence/ane-direct-api-m5/README.md", "ranges": [[212, 220], [289, 416]], "role": "doc" },
+
+    // ---- Harness contract and protected comparator context ----
+    { "path": "bench/campaign/ane-direct-embed-harness.sh", "ranges": "whole", "role": "reference" },
+    { "path": "bench/spikes/ane-direct-probe/src/bin/modernbert_full.rs", "ranges": [[838, 1130], [1166, 1319]], "role": "reference" }
+  ]
+}
