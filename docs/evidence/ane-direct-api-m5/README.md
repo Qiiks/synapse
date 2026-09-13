@@ -383,6 +383,32 @@ gather, f32/fp16 IOSurface conversion, every private-API dispatch, output readba
 and L2 normalization. The workstation was shared and busy; absolute values are
 ambient-contaminated and exist only to seed a later matched campaign baseline.
 
+### Against the Core ML lane at the same shapes
+
+The Core ML figures below come from the rotated tiled export measured in
+`docs/evidence/ane-modernbert-8192-latency` (warm, quiet box), and from the
+shipping 512 lane. They were taken under different load than the direct-API
+rows, so the ratios are indicative rather than matched.
+
+| sequence | direct API, 1 layer/executable | Core ML | direct / Core ML |
+|---:|---:|---:|---:|
+| 512 | 31.62 ms | 25.5 ms | 1.24x |
+| 1024 | 103.89 ms | 33 ms | 3.1x |
+| 2048 | 213.35 ms | 98 ms | 2.2x |
+
+At 512 the direct port sits where the per-layer attribution predicted. Beyond
+512 it scales worse than Core ML does: 3.3x from 512 to 1024 against Core ML's
+1.3x. Something in this graph grows with sequence length that Core ML's compiler
+does not pay for, and it is the first thing a campaign should attribute — it is
+worth more than the fusion lead above. The independent re-run of the 512 gate on
+2026-09-13 reproduced the reported minimum and mean cosine exactly
+(0.9991073 / 0.9995399, deterministic, load 11.7).
+
+The margin at 512 is thin: 0.9991 against a 0.999 gate, with a transient
+layer-16 checkpoint minimum of 0.9989. The tanh GELU approximation and the fp16
+IOSurface boundary after every layer have already spent most of the headroom, so
+the gate is strict for anything a campaign changes.
+
 **Baseline verdict: valid.** The direct-API port uses real checkpoint weights,
 passes the unchanged final-vector and determinism gates at every requested shape,
 and exposes one- or two-layer executable grouping without changing model math.
