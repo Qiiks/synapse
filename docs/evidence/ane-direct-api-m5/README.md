@@ -19,9 +19,13 @@ a 512-position row, against **25.5 ms** for the same model through the shipping
 Core ML lane. So direct access reaches Core ML's league but does not beat it by
 being faithful. Any win has to come from doing something Core ML does not.
 
-The reason is concentrated in one place: ops with compile-time weights run at
-4,800 to 10,500 GFLOP/s, and attention, which needs runtime operands on both
-sides, runs at about 1,000. Attention is over half the remaining cost.
+The gap is concentrated in one place: constant-weight projection and
+feed-forward graphs run at 4,800 to 10,500 GFLOP/s, while the complete batched
+attention graph runs at about 1,000. This is not a tenfold, apples-to-apples
+penalty for runtime operands. The matched-shape probe below found that baking one
+operand into `matrix_multiplication` did not make that operator faster; operator
+choice, matrix geometry, and the rest of the attention graph account for the
+comparison. Attention is still over half the remaining cost.
 
 ## The API works here, and computes exactly
 
@@ -75,6 +79,114 @@ A 128-token window at 512 positions touches a quarter of the score matrix, but
 measured only 1.6x cheaper rather than 4x. Each 128-query tile attends to a
 256-position halo, so the saving is 2x in arithmetic before accounting for four
 tile matmuls running slightly slower per FLOP than one large one.
+
+## Why dynamic attention is slower
+
+A follow-up run on 2026-09-13 isolated one attention score multiplication:
+12 channels of `[512, 64] @ [64, 512]`, or 0.403 GFLOP. Each candidate ran in
+the same process immediately back-to-back with the dynamic, already-head-laid-out
+baseline. The 25 samples alternated execution order and the table reports their
+medians. The one-minute load average was **14.35 for every row**. These are wall
+clock figures and include the roughly 92 µs dispatch cost.
+
+Unlike the earlier timing-only arms, every arm in `attention_gap` used distinct
+deterministic inputs and had to match an independent CPU matrix multiplication
+before it was timed. Maximum absolute errors ranged from 0.000238 to 0.001874;
+the failure threshold was 0.003. The reference signal also had to be strong enough
+that an all-zero output would fail. **No arm failed** to compile, execute, or match
+its reference. Run it from the probe workspace with:
+
+```sh
+cargo run --release --bin attention_gap
+```
+
+### Layout and operand residency
+
+Lower ratios are faster. The baseline is remeasured beside each candidate rather
+than borrowed from another point in the run.
+
+| candidate | candidate ms | paired baseline ms | candidate / baseline | GFLOP/s |
+|---|---:|---:|---:|---:|
+| reshape + transpose before matmul | 0.187 | 0.222 | 0.842x | 2,150 |
+| constant RHS, still `matrix_multiplication` | 0.201 | 0.209 | 0.964x | 2,002 |
+| constant RHS through `inner_product` | 0.183 | 0.233 | 0.786x | 2,196 |
+
+The transposes do not explain the gap. They were effectively free in this graph;
+the graph containing them was actually 16% faster in the paired run, consistent
+with fusion or a different internal tiling choice rather than materialized layout
+traffic.
+
+Baking the right-hand operand changed dynamic matmul time by only 4%. That
+rejects operand residency as the main cause: `matrix_multiplication` does not
+turn into the optimized constant-weight path merely because one input is a
+constant. An exactly equivalent `inner_product` was 21% faster, but not ten
+times faster. For that comparison the key matrix was shared across heads so the
+same useful multiply-adds could be represented by one baked linear; real
+attention keys depend on the input and cannot use this formulation.
+
+The earlier 4,800-10,500 versus 1,000 GFLOP/s comparison therefore combines
+different operators, shapes, and graph contents. In isolation the canonical
+runtime matmul sustained about 1,700-2,020 GFLOP/s. The remaining drop to the
+roughly 1,000 GFLOP/s full-attention result includes the second matmul, softmax,
+and surrounding graph. The evidence available through this private API points
+to its `matrix_multiplication` lowering, not IOSurface residency or explicit
+transpose cost; the private compiler exposes no lower-level counter with which
+to attribute that lowering further.
+
+### Shape and tiling
+
+Each row performs the same 0.403 GFLOP as the canonical 12-channel
+`512 x 64 x 512` baseline. Changing channel count or dimensions changes the
+operation's meaning, so these rows diagnose the kernel rather than propose a
+faithful attention replacement.
+
+| channels and M x K x N | candidate ms | paired baseline ms | candidate / baseline | GFLOP/s |
+|---|---:|---:|---:|---:|
+| 6 and 512 x 128 x 512 | 0.173 | 0.220 | 0.786x | 2,332 |
+| 3 and 512 x 256 x 512 | 0.148 | 0.207 | 0.715x | 2,713 |
+| 1 and 512 x 768 x 512 | 0.121 | 0.200 | 0.605x | 3,332 |
+| 12 and 256 x 256 x 256 | 0.168 | 0.212 | 0.789x | 2,403 |
+| 12 and 128 x 1024 x 128 | 0.236 | 0.216 | 1.096x | 1,703 |
+
+Geometry matters, but not enough to close the gap. Combining all head dimensions
+into one channel was the best case at 1.65x lower latency and 3,332 GFLOP/s. It
+also replaces twelve independent attention distributions with one distribution
+whose dot products cross head boundaries, so it is not usable by the model.
+A larger reduction dimension is not sufficient by itself: the 128 x 1024 x 128
+case was 10% slower than canonical.
+
+### Split versus fused heads
+
+These arms preserve the canonical result. Inputs are already in
+`[head, sequence, head_dim]` layout, the channel axis is sliced into equal groups,
+and grouped outputs are concatenated in their original order. Every row matched
+the same CPU reference as the one-op baseline.
+
+| matmul groups | candidate ms | paired baseline ms | candidate / baseline | GFLOP/s |
+|---:|---:|---:|---:|---:|
+| 2 | 0.348 | 0.227 | 1.533x | 1,157 |
+| 3 | 0.309 | 0.208 | 1.480x | 1,305 |
+| 4 | 0.264 | 0.238 | 1.111x | 1,523 |
+| 6 | 0.233 | 0.208 | 1.120x | 1,726 |
+| 12 | 0.228 | 0.228 | 1.001x | 1,763 |
+
+One matmul over all 12 head channels remains the optimum. Twelve correctly laid
+out matmuls tied it within 1%, but no split beat it; two and three groups were
+about 50% slower. This does not contradict the earlier 53x result, whose sliced
+form starts from model layout and carries two matmuls plus softmax per head. It
+does show there is no profitable intermediate group count hidden between the
+one-op and per-head endpoints.
+
+### Closability verdict
+
+**The gap is not closable by any formulation tested.** Transposes are not the
+cost, a constant operand does not accelerate `matrix_multiplication`, and every
+semantically faithful split is no faster than one batched op. Shape can recover
+at most 1.65x here only by changing multi-head attention's meaning. The best
+available faithful formulation therefore remains the existing batched attention
+graph, and the estimate remains **30.5 ms for 22 layers versus Core ML's 25.5
+ms**. There is no new per-layer extrapolation to report because no valid arm
+improved that graph.
 
 ## No SRAM cliff on this chip
 
@@ -159,16 +271,19 @@ this would be compared against.
 
 ## What is not measured
 
-Numerics. Every arm uses random weights and checks no output, so none of this
-says a ported model would produce correct vectors. A correctness gate against
-the existing reference is required before any of it is believed as a model.
+Full-model numerics. The original layer and attribution timings use random
+weights and check no output, so none of them says a ported model would produce
+correct vectors. The follow-up score-matmul arms do check their complete outputs
+against a CPU reference, but a correctness gate against the existing model
+reference is still required before any full port is believed.
 
-Two arms in the attribution probe report `execute failed`: four projections in
-one graph, and a single dynamic matmul. Both build graphs with several terminal
-tensors while the harness binds one output buffer, so execution refuses them.
-That is a harness limitation rather than an API one, and it leaves the dynamic
-matmul unpriced in isolation. Chaining the projections into a single terminal
-fixes it, as the residency probe does.
+Two historical arms in `layer_attribution` still report `execute failed`: four
+projections in one graph, and its original single dynamic matmul. Both build
+graphs with several terminal tensors while that harness binds one output buffer,
+so execution refuses them. This is a harness limitation rather than an API one.
+Chaining the projections into a single terminal fixes the first case, as the
+residency probe does; `attention_gap` now prices isolated dynamic matmul with one
+terminal and a checked output.
 
 Everything here is one machine, one chip, one OS build. The private API is
 undocumented and can change without notice.
