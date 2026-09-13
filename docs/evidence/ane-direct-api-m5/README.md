@@ -398,9 +398,8 @@ rows, so the ratios are indicative rather than matched.
 
 At 512 the direct port sits where the per-layer attribution predicted. Beyond
 512 it scales worse than Core ML does: 3.3x from 512 to 1024 against Core ML's
-1.3x. Something in this graph grows with sequence length that Core ML's compiler
-does not pay for, and it is the first thing a campaign should attribute — it is
-worth more than the fusion lead above. The independent re-run of the 512 gate on
+1.3x. The sequence-scaling attribution below locates that difference in dynamic
+global attention rather than the linear graph structures. The independent re-run of the 512 gate on
 2026-09-13 reproduced the reported minimum and mean cosine exactly
 (0.9991073 / 0.9995399, deterministic, load 11.7).
 
@@ -408,6 +407,80 @@ The margin at 512 is thin: 0.9991 against a 0.999 gate, with a transient
 layer-16 checkpoint minimum of 0.9989. The tanh GELU approximation and the fp16
 IOSurface boundary after every layer have already spent most of the headroom, so
 the gate is strict for anything a campaign changes.
+
+### Sequence-scaling attribution — 2026-09-13
+
+`sequence_attribution` measured the sequence-dependent structures independently
+at 512, 1024, and 2048 positions. Each comparison used 15 alternating,
+back-to-back samples in one process and reports the median. The paired synthetic
+full-layer denominators include both rescaled normalizations, QKV and output
+projections, two RoPE applications, tiled attention with production masks, and
+the gated MLP. The global/local schedule-weighted denominator uses 8 global and
+14 local layers.
+
+| denominator | 512 | 1024 | 2048 |
+|---|---:|---:|---:|
+| synthetic global layer | 1.416 ms | 3.882 ms | 12.493 ms |
+| synthetic local layer | 1.229 ms | 2.083 ms | 4.363 ms |
+| schedule-weighted layer | 1.297 ms | 2.737 ms | 7.319 ms |
+
+Every equivalent arm matched an independent CPU reference before timing. The
+worst maximum absolute error was 0.004331 at 2048. The mask-free local arm is
+numerically wrong by design, and its output lines say `TIMING-ONLY`; the plain
+mean and RoPE identity comparisons and synthetic full-layer denominators carry
+the same label because they make no equivalence claim. Load1 was 5.77–6.00 for
+all rows in this run.
+
+| suspect, per transformer layer | 512 ms / layer fraction | 1024 ms / layer fraction | 2048 ms / layer fraction | growth, 512→1024 |
+|---|---:|---:|---:|---:|
+| tiled global attention core | 0.712 / 50.3% global | 2.391 / 61.6% global | 8.928 / 71.5% global | **3.36x** |
+| un-tiled global attention core | 0.683 / 48.2% global | 2.377 / 61.2% global | 22.763 / 182.2% global | **3.48x** |
+| local padding slices + distance constants, mask-free delta | 0.074 / 6.0% local | 0.176 / 8.5% local | 0.393 / 9.0% local | 2.40x |
+| rescaled LayerNorm, two per ordinary layer | 0.303 / 23.3% scheduled | 0.507 / 18.5% scheduled | 0.860 / 11.8% scheduled | 1.68x |
+| 22-executable IOSurface chain, total divided by 22 | 0.174 / 13.4% scheduled | 0.182 / 6.7% scheduled | 0.162 / 2.2% scheduled | 1.05x |
+| two RoPE applications, whole-executable upper bound | 0.185 / 14.3% scheduled | 0.280 / 10.2% scheduled | 0.466 / 6.4% scheduled | 1.51x |
+
+Fractions compare independently compiled graphs and therefore attribute latency,
+not additive components. Compiler context can matter: the isolated 2048
+un-tiled attention graph is slower than the complete tiled global layer. That
+is itself a negative result, not evidence that the full layer has negative-cost
+projections.
+
+The local distance masks are one fp16 graph constant per query tile. They total
+4 constants / 229,376 bytes at 512, 8 / 491,520 at 1024, and 16 / 1,015,808 at
+2048. Removing both those constants and the sliced runtime padding mask bounds
+the combined mask cost at 0.074, 0.176, and 0.393 ms per local layer. It grows,
+but contributes only about 1.4 ms to the model's 512→1024 increase across all 14
+local layers. The empty 22-executable chains took 3.817, 4.008, and 3.562 ms in
+total, so IOSurface traffic did not grow measurably with shape in this range.
+
+The normalization premise also needed correction. A normal transformer layer in
+this port has two LayerNorms, not three; layer 0 omits attention normalization.
+There are 43 normalizations inside the 22 transformer layers, plus embedding and
+final normalization. One rescaled normalization grew from 0.151 to 0.254 ms,
+while a plain channel `reduce_mean` grew only from 0.107 to 0.125 ms, but the two
+normalizations still grew much more slowly than global attention.
+
+**Named cause: the direct API's dynamic global-attention lowering, not query
+tiling.** Global attention is the only dominant arm that grows about 3.4–3.5x
+from 512 to 1024; its score and value products grow quadratically. The faithful
+local attention core grows 1.88x, and every linear suspect is smaller. Across
+eight global layers, the tiled attention increase alone is about 13.4 ms per
+model, versus about 1.4 ms for masks. Removing query tiling does not recover the
+Core ML curve: it saves just 0.029 ms at 512 and 0.014 ms at 1024, grows slightly
+*faster* over that interval, and is 2.55x slower than tiling at 2048. The direct
+API exposes no lower-level kernel choice with which to reproduce Core ML's
+lowering, so this scaling cost is inherent to the available faithful
+`matrix_multiplication` formulation.
+
+There is consequently no full-model timing replacement to report. No candidate
+both changed the scaling materially and preserved the formulation, so
+`modernbert_full.rs`, the row set, and its min-cosine/determinism gate remain
+unchanged. Run the attribution from the standalone workspace with:
+
+```sh
+cargo run --release --bin sequence_attribution
+```
 
 **Baseline verdict: valid.** The direct-API port uses real checkpoint weights,
 passes the unchanged final-vector and determinism gates at every requested shape,
