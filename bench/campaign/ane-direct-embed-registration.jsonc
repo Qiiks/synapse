@@ -7,16 +7,16 @@
 {
   "machine": "m5-local",
   "harness_path": "bench/campaign/ane-direct-embed-harness.sh",
-  "harness_sha256": "25fd123291206020008e56bf6f7ef573cc0f18c7f16cc68258c313eb4877510f",
+  "harness_sha256": "a3f9546e2402ffb5ce077a915cb52d609e2f964de732807e40b0d68291185933",
   "parameters": {},
   "parity_command": {
-    "harness_sha256": "25fd123291206020008e56bf6f7ef573cc0f18c7f16cc68258c313eb4877510f",
+    "harness_sha256": "a3f9546e2402ffb5ce077a915cb52d609e2f964de732807e40b0d68291185933",
     "program": "{harness}",
     "args": ["{workspace}", "{candidate_runner}", "{result}"],
     "env": {
       "HF_HUB_OFFLINE": "1",
       "TRANSFORMERS_OFFLINE": "1",
-      "SYNAPSE_CAMPAIGN_BASELINE_TOK_S": "8941.75223984836",
+      "SYNAPSE_CAMPAIGN_BASELINE_TOK_S": "9222.454033809034",
       "SYNAPSE_CAMPAIGN_MODEL": "<RIG>/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots/e7f32e3c00f91d699e8c43b53106206bcc72bb22",
       "SYNAPSE_CAMPAIGN_MODEL_SHA256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
       "SYNAPSE_CAMPAIGN_ROWS_SHA256": "f4889a38df77b9940ce973c4d9b82857d0c401987ae8e77b5ca25e6062808c39",
@@ -30,13 +30,13 @@
     }
   },
   "objective_command": {
-    "harness_sha256": "25fd123291206020008e56bf6f7ef573cc0f18c7f16cc68258c313eb4877510f",
+    "harness_sha256": "a3f9546e2402ffb5ce077a915cb52d609e2f964de732807e40b0d68291185933",
     "program": "{harness}",
     "args": ["{workspace}", "{candidate_runner}", "{result}"],
     "env": {
       "HF_HUB_OFFLINE": "1",
       "TRANSFORMERS_OFFLINE": "1",
-      "SYNAPSE_CAMPAIGN_BASELINE_TOK_S": "8941.75223984836",
+      "SYNAPSE_CAMPAIGN_BASELINE_TOK_S": "9222.454033809034",
       "SYNAPSE_CAMPAIGN_MODEL": "<RIG>/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots/e7f32e3c00f91d699e8c43b53106206bcc72bb22",
       "SYNAPSE_CAMPAIGN_MODEL_SHA256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
       "SYNAPSE_CAMPAIGN_ROWS_SHA256": "f4889a38df77b9940ce973c4d9b82857d0c401987ae8e77b5ca25e6062808c39",
@@ -55,6 +55,7 @@
       "parity_passed": {"type": "boolean"},
       "determinism_passed": {"type": "boolean"},
       "median_tok_s": {"type": "number"},
+      "aggregate_tok_s": {"type": "number"},
       "min_cosine": {"type": "number"},
       "sequence_1024_tok_s": {"type": "number"},
       "sequence_2048_tok_s": {"type": "number"}
