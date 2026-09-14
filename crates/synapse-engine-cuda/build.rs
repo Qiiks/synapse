@@ -30,14 +30,28 @@ fn main() {
         .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/cuda"));
     let include = cuda_root.join("include");
 
+    // CUDACXX names the compiler outright (cross/toolchain installs); otherwise
+    // resolve nvcc under the toolkit root. Windows needs the .exe suffix:
+    // `bin/nvcc` does not exist there and cc::Build reports it as a missing
+    // compiler rather than falling back to the host C++ compiler.
+    let nvcc = std::env::var_os("CUDACXX")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let name = if target_os == "windows" {
+                "nvcc.exe"
+            } else {
+                "nvcc"
+            };
+            cuda_root.join("bin").join(name)
+        });
+
     let mut build = cc::Build::new();
     build
-        .compiler(cuda_root.join("bin/nvcc"))
+        .compiler(&nvcc)
         .cpp(true)
         .no_default_flags(true)
         .warnings(false)
         .extra_warnings(false)
-        .flag("-Xcompiler=-fPIC")
         .include("src/port")
         .include(&include)
         // V1 distributes virtual PTX only. Do not add an sm_* SASS image here.
@@ -47,6 +61,12 @@ fn main() {
         .file("src/port/cuda_minilm.cu")
         .file("src/port/cuda_modernbert.cu")
         .file("src/port/cuda_qwen3.cu");
+    // Position-independent host code is an ELF concern. Forwarded to MSVC it is
+    // an unknown-option error out of cl, which nvcc surfaces as a build failure,
+    // so the flag is applied only where the host toolchain accepts it.
+    if target_os != "windows" {
+        build.flag("-Xcompiler=-fPIC");
+    }
     if std::env::var("PROFILE").as_deref() == Ok("release") {
         build.flag("-lineinfo");
     }
@@ -58,6 +78,20 @@ fn main() {
         cuda_root.join("lib64")
     };
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    if target_os == "windows" {
+        // CUDA 13's redist archives place cublas's import library beside its
+        // DLL in bin/x64 (the 12.x layout keeps it under lib/x64). Search
+        // both so cublas/cublasLt resolve on either toolkit line; duplicated
+        // search paths are harmless to link.exe.
+        println!(
+            "cargo:rustc-link-search=native={}",
+            cuda_root.join("bin/x64").display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}",
+            cuda_root.join("bin").display()
+        );
+    }
     println!("cargo:rustc-link-lib=cuda");
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");

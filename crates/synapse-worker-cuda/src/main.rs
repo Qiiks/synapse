@@ -6,14 +6,16 @@ use std::path::PathBuf;
 #[cfg(feature = "cuda")]
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
-use synapse_core::worker_framing_sync::{
-    read_frame, read_json_frame, write_frame, write_json_frame,
-};
+#[cfg(unix)]
+use synapse_core::worker_framing_sync::read_json_frame;
+use synapse_core::worker_framing_sync::{read_frame, write_frame, write_json_frame};
+#[cfg(unix)]
+use synapse_core::WorkerHelloAck;
 use synapse_core::{
-    decode_i32_frame, encode_f32_frame, owned_cuda_engine_identity, WorkerHello, WorkerHelloAck,
-    WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
+    decode_i32_frame, encode_f32_frame, owned_cuda_engine_identity, WorkerHello, WorkerRequest,
+    WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
 };
 #[cfg(feature = "cuda")]
 use synapse_core::{EmbedEngine, RuntimeConfig, TokenBatch, ValidatedArtifact};
@@ -113,16 +115,17 @@ fn main() -> Result<()> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (args, hello);
-        bail!("owned-CUDA worker transport is unsupported on this target");
+        anyhow::bail!("owned-CUDA worker transport is unsupported on this target");
     }
 }
 
+#[cfg(unix)]
 fn validate_ack(ack: &WorkerHelloAck) -> Result<()> {
     if ack.v != WORKER_PROTOCOL_VERSION {
-        bail!("module replied with unsupported protocol v{}", ack.v);
+        anyhow::bail!("module replied with unsupported protocol v{}", ack.v);
     }
     if !ack.accept {
-        bail!("module rejected owned-CUDA worker handshake");
+        anyhow::bail!("module rejected owned-CUDA worker handshake");
     }
     Ok(())
 }
