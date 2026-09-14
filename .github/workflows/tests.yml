@@ -636,17 +636,16 @@ jobs:
             }
             $expanded = Join-Path $env:RUNNER_TEMP "x-$($c.name)"
             Expand-Archive $zip -DestinationPath $expanded
-            Copy-Item (Join-Path $expanded '*') $root -Recurse -Force
+            # Each archive extracts to a single nested package directory; the
+            # toolkit root must hold bin/, include/, lib/ directly, so copy the
+            # contents of that directory rather than the directory itself.
+            Copy-Item (Join-Path $expanded '*\*') $root -Recurse -Force
             $digests += "$($c.name)=$($c.version) sha256=$actual"
-          }
-          # Redist archives extract nested one directory deep; the merge above
-          # flattens them onto the toolkit root layout nvcc expects.
-          if (-not (Test-Path (Join-Path $root 'bin\nvcc.exe'))) {
-            throw 'assembled toolkit has no bin/nvcc.exe'
           }
           "CUDA_PATH=$root" >> $env:GITHUB_ENV
           "CUDA_HOME=$root" >> $env:GITHUB_ENV
-          "PATH=$root\bin;$env:PATH" >> $env:GITHUB_ENV
+          # bin holds the nvcc drivers; bin\x64 holds CUDA 13's runtime DLLs.
+          "PATH=$root\bin\x64;$root\bin;$env:PATH" >> $env:GITHUB_ENV
           New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\synapse\build-gates" | Out-Null
           $digests -join "`n" |
             Set-Content "$env:GITHUB_WORKSPACE\synapse\build-gates\windows-owned-cuda-toolkit.txt"
@@ -656,6 +655,19 @@ jobs:
         working-directory: synapse
         shell: pwsh
         run: |
+          # nvcc drives the host C++ compiler (cl.exe) by name and it is not on
+          # PATH on a clean runner; cc-rs then fails before compiling anything.
+          # Locally reproduced: `nvcc fatal: Cannot find compiler 'cl.exe' in
+          # PATH`. Enter the MSVC developer environment for this shell only —
+          # a per-step import, so no later step inherits it unexpectedly.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $install = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $install) { throw 'no MSVC with VC.Tools.x86.x64 on this runner' }
+          Import-Module (Join-Path $install 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $install -SkipAutomaticLocation `
+            -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
           New-Item -ItemType Directory -Force build-gates | Out-Null
           $command = 'cargo build -p synapse-worker-cuda --no-default-features --features cuda --release'
           $log = 'build-gates/windows-x86_64-msvc-owned-cuda.output'
@@ -718,8 +730,10 @@ jobs:
           if ($isolatedCode -ne -1073741515) {
             throw "owned-CUDA worker failed off-PATH with exit $isolatedCode, expected -1073741515 (0xC0000135 STATUS_DLL_NOT_FOUND)"
           }
-          # Restore the toolkit bin directory and prove the worker starts.
-          $env:PATH = "$env:CUDA_PATH\bin;C:\Windows\system32;C:\Windows"
+          # CUDA 13's redist layout keeps the runtime DLLs under bin\x64 (the
+          # nvcc drivers sit in bin); both directories are needed, as verified
+          # locally. With them restored the worker must start.
+          $env:PATH = "$env:CUDA_PATH\bin\x64;$env:CUDA_PATH\bin;C:\Windows\system32;C:\Windows"
           & $exe --version
           if ($LASTEXITCODE -ne 0) {
             throw "owned-CUDA worker --version failed with CUDA on PATH (exit $LASTEXITCODE)"
