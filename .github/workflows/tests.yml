@@ -711,6 +711,10 @@ jobs:
       # A worker that silently compiled CPU-only prints --version both times,
       # which this step refuses. It also records, in CI, the sidecar fact the
       # release/installer PR must solve: the worker is not self-contained.
+      # Caveat: the discriminator depends on cudart/cublas staying load-time
+      # imports; if a future build moves them to delay-load, the off-PATH run
+      # exits 0 and this step reports "cuda feature is not compiled" — a false
+      # failure that points at the real cause rather than hiding it.
       - name: Assert the packaged worker really carries the CUDA backend
         working-directory: synapse
         shell: pwsh
