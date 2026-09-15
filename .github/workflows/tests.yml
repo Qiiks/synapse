@@ -548,9 +548,40 @@ jobs:
             Set-Content "$env:GITHUB_WORKSPACE\synapse\build-gates\windows-vulkan-sdk.txt"
           & "$sdkPath\Bin\glslc.exe" --version
 
+      # Ninja is not on the hosted Windows image by default, and the build step
+      # below selects it as the CMake generator. Retried because the Chocolatey
+      # CDN has flaked on this repository before.
+      - name: Install Ninja
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          if (Get-Command ninja -ErrorAction SilentlyContinue) {
+            Write-Host "ninja already present: $((Get-Command ninja).Source)"
+          } else {
+            $attempts = 0
+            while ($true) {
+              $attempts++
+              choco install ninja -y --no-progress | Out-Null
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempts -ge 3) { throw "choco install ninja failed after $attempts attempts" }
+              Start-Sleep -Seconds 20
+            }
+          }
+          ninja --version
+
       - name: Windows llama Vulkan manual build gate
         working-directory: synapse
         shell: pwsh
+        env:
+          # ggml-vulkan builds its shader generator as a CMake ExternalProject.
+          # Under the default Visual Studio generator MSBuild runs those steps
+          # as parallel projects, and the install step reached cmake_install.cmake
+          # before the configure step had written it — the log interleaves
+          # "4>Performing install step" with "3>Performing configure step" and
+          # then fails with "Not a file". Ninja orders the sub-build correctly,
+          # and is what llama.cpp's own Vulkan workflow uses on Windows for the
+          # same build.
+          CMAKE_GENERATOR: Ninja
         run: |
           New-Item -ItemType Directory -Force build-gates | Out-Null
           $command = 'cargo build -p synapse-worker-llama --no-default-features --features vulkan --release'
