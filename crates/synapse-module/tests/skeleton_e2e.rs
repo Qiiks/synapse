@@ -3931,8 +3931,20 @@ fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_lite
     );
 }
 
+/// How long to wait for another test process to release the MiniLM fixture
+/// lock before concluding its holder is gone. The longest legitimate hold is
+/// one e2e test's daemon lifetime, comfortably under a minute.
+const MINILM_E2E_LOCK_WAIT: Duration = Duration::from_secs(180);
+
 fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
     let path = std::env::temp_dir().join("synapse-minilm-e2e.lock");
+    // Bounded, because the previous unbounded loop turned a stale lock into an
+    // unkillable test run: a cancelled or killed holder leaves the file behind,
+    // its Drop never runs, and every later MiniLM test spins here forever
+    // waiting for a process that no longer exists. That is indistinguishable
+    // from a hung test until someone finds the file by hand — it cost a 900s
+    // run and two worker timeouts before it was diagnosed.
+    let deadline = Instant::now() + MINILM_E2E_LOCK_WAIT;
     loop {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -3941,6 +3953,14 @@ fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
         {
             Ok(file) => return MinilmE2eLock { path, file },
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                assert!(
+                    Instant::now() < deadline,
+                    "MiniLM e2e fixture lock at {} was held for over {}s. If no other \
+                     test is running, a previous run was killed before releasing it; \
+                     delete the file to recover.",
+                    path.display(),
+                    MINILM_E2E_LOCK_WAIT.as_secs()
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
             // Windows keeps a deleted-but-still-open file in a delete-pending
@@ -3948,6 +3968,12 @@ fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
             // rather than already-exists. That is the holder releasing the
             // lock, so it is the same transient condition as a held lock.
             Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                assert!(
+                    Instant::now() < deadline,
+                    "MiniLM e2e fixture lock at {} stayed delete-pending for over {}s",
+                    path.display(),
+                    MINILM_E2E_LOCK_WAIT.as_secs()
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(error) => panic!("failed to acquire MiniLM e2e lock: {error}"),
