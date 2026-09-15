@@ -514,8 +514,24 @@ jobs:
           if ($digest -ne $env:LLAMA_VULKAN_SDK_ARCHIVE_SHA256) {
             throw "Vulkan SDK installer digest $digest does not match pinned $env:LLAMA_VULKAN_SDK_ARCHIVE_SHA256"
           }
+          # /S and /D= are NSIS flags. LunarG moved to the Qt installer framework
+          # in SDK 1.2.189.1 and documents those flags as replaced; a 1.3.x
+          # installer does not recognise them, so it falls back to opening its
+          # GUI and waits for input that never comes on a runner. That is the
+          # real reason this gate consumed 2h26m without output, and it is why
+          # the earlier read of "the download stalls" was wrong: with the
+          # transfer now reporting its byte count, the log shows all 175 MB
+          # arriving and the time going to the installer instead.
+          # copy_only=1 skips registry, PATH and shortcut work this gate does not
+          # need; it only wants the headers and glslc.
           $install = Join-Path $env:RUNNER_TEMP "vulkan-sdk-$env:LLAMA_VULKAN_SDK_VERSION"
-          $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$install") -Wait -PassThru
+          $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+            '--root', $install,
+            '--accept-licenses',
+            '--default-answer',
+            '--confirm-command', 'install',
+            'copy_only=1'
+          )
           if ($process.ExitCode -ne 0) { throw "Vulkan SDK installer failed with exit code $($process.ExitCode)" }
           $sdk = @((Get-Item $install), (Get-ChildItem $install -Directory -Recurse)) |
             Where-Object { Test-Path (Join-Path $_.FullName 'Include\vulkan\vulkan.h') } |
