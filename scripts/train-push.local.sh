@@ -19,9 +19,27 @@ if [ "$(uname -s)" = "Darwin" ]; then
   if [ -d /Applications/Xcode.app ]; then
     export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
   fi
+  # These two commands rewrite Cargo.lock as a side effect, because the sibling
+  # path dependencies (../subconscious, ../commons) are other agents' working
+  # checkouts and routinely sit ahead of siblings.lock. That rewrite dirties the
+  # tree, and the NEXT train then refuses on a change this script made itself.
+  #
+  # --locked does not solve it: it refuses to run at all whenever a sibling has
+  # moved, which here is most of the time, and those checkouts are not ours to
+  # roll back. CI is unaffected either way because it checks the siblings out at
+  # the pinned commits. So verify against whatever is on disk, then put the lock
+  # back exactly as it was — and leave a deliberate lock edit alone.
+  lock_was_clean=no
+  git diff --quiet -- Cargo.lock 2>/dev/null && lock_was_clean=yes
+  restore_lock() {
+    if [ "$lock_was_clean" = yes ]; then
+      git checkout -- Cargo.lock 2>/dev/null || true
+    fi
+  }
   # shellcheck disable=SC2086
   cargo clippy $mac_crates --all-targets -- -D warnings \
-    || refuse "macOS-only crates failed clippy (CI cannot run these; see scripts/train-push.local.sh)"
+    || { restore_lock; refuse "macOS-only crates failed clippy (CI cannot run these; see scripts/train-push.local.sh)"; }
   cargo test -p synapse-engine-owned --lib \
-    || refuse "synapse-engine-owned lib tests failed (CI cannot run these)"
+    || { restore_lock; refuse "synapse-engine-owned lib tests failed (CI cannot run these)"; }
+  restore_lock
 fi
