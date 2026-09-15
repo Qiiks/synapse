@@ -46,7 +46,7 @@ env:
   # macOS- and CUDA-only engines cannot build here, but anything portable left
   # out is simply unbuilt and untested: the operator CLI shipped for weeks with
   # its tests never once running in CI.
-  SYNAPSE_CRATES: -p synapse-core -p synapse-engine-ort -p synapse-module -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl
+  SYNAPSE_CRATES: -p synapse-core -p synapse-engine-ort -p synapse-module -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda
 
 jobs:
   test:
@@ -539,4 +539,217 @@ jobs:
         with:
           name: llama-build-gates-windows-vulkan-manual-${{ github.run_id }}
           path: synapse/build-gates
+          if-no-files-found: error
+
+  windows-owned-cuda-manual:
+    if: github.event_name == 'workflow_dispatch'
+    name: windows-owned-cuda-manual-gate
+    # The owned-CUDA engine (crates/synapse-engine-cuda) is the VRAM-resident
+    # embedding lane: safetensors weights held on the GPU, CUDA Graphs, PTX
+    # targeting virtual arch compute_75. It has never had a Windows build
+    # gate, so nothing in CI proved its build script could even find nvcc on
+    # MSVC — nvcc needs the .exe suffix there, and -Xcompiler=-fPIC is a
+    # cl-fatal unknown option. Both are pinned by this lane.
+    #
+    # The toolkit is assembled from NVIDIA's redist archives (per-component,
+    # SHA256-pinned, no installer, no driver) merged into one root — the same
+    # recipe llama.cpp's windows-setup-cuda action uses. ubuntu-24.04's apt
+    # approach has no Windows analogue, and the network-bound CI runner is
+    # where this belongs rather than a developer machine.
+    runs-on: windows-2025
+    env:
+      OWNED_CUDA_REDIST_BASE: https://developer.download.nvidia.com/compute/cuda/redist
+      # CUDA 13.2.1 redist. 13.x is the line whose runtime DLLs
+      # (cudart64_13 / cublas64_13 / cublasLt64_13) llama.cpp's Windows CUDA
+      # builds already ship, so a worker built against it drops into an
+      # existing CUDA-13 deployment without dragging a second runtime.
+      # The engine floor (driver API >= 12040, virtual arch compute_75) is
+      # satisfied: 13.x still targets compute_75 as its minimum live arch.
+      OWNED_CUDA_VERSION: 13.2.1
+      # component version + windows-x86_64 sha256 from redistrib_13.2.1.json.
+      # nvcc/crt/nvvm/cccl are the compile-time set (the crt and cccl headers
+      # are included by crt/math_functions.h chains); cudart/libcublas supply
+      # the import libraries the link flags name and the runtime DLLs.
+      OWNED_CUDA_NVCC_SHA256: da33f46a1a907a12abd0c192bbe907057b1e2269fdccfc778101fb02161e1c59
+      OWNED_CUDA_CRT_SHA256: 0e19f9d23451d77e32794d53bb110a4eecb26d9542391dbb3f997a688c9ddecc
+      OWNED_CUDA_NVVM_SHA256: 2cbd83a3d8bd594cb53cb1b7d0e129b0931f21915aa61c71c7491374b23e9b62
+      OWNED_CUDA_CCCL_SHA256: 4c799e2c502ccc9a712d90baa102d9a2f6c50d6303f9e07a227ef4756c4d0a6a
+      OWNED_CUDA_CUDART_SHA256: 8c7f187543545cefdbf55f66ecb8c990e159e38a78694fda50e251fcb2f4fe5f
+      OWNED_CUDA_CUBLAS_SHA256: af2de4aab12ce773f934529877ae444452ddf9a5b1156aa2d7549f0ca39693ea
+    steps:
+      - name: Create cross-repo token
+        id: app-token
+        if: ${{ env.HAS_CROSS_REPO_TOKEN == 'true' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: synapse,subconscious,commons
+
+      - name: Checkout synapse
+        uses: actions/checkout@v4
+        with:
+          path: synapse
+
+      - name: Checkout subconscious (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: cortexkit/subconscious
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          path: subconscious
+
+      - name: Checkout commons (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: cortexkit/commons
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          path: commons
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Assemble pinned CUDA toolkit from redist archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'cuda-owned'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $components = @(
+            @{ name = 'cuda_nvcc';    version = '13.2.78';   sha256 = $env:OWNED_CUDA_NVCC_SHA256 },
+            @{ name = 'cuda_crt';     version = '13.2.78';   sha256 = $env:OWNED_CUDA_CRT_SHA256 },
+            @{ name = 'libnvvm';      version = '13.2.78';   sha256 = $env:OWNED_CUDA_NVVM_SHA256 },
+            @{ name = 'cuda_cccl';    version = '13.2.75';   sha256 = $env:OWNED_CUDA_CCCL_SHA256 },
+            @{ name = 'cuda_cudart';  version = '13.2.75';   sha256 = $env:OWNED_CUDA_CUDART_SHA256 },
+            @{ name = 'libcublas';    version = '13.4.0.1';  sha256 = $env:OWNED_CUDA_CUBLAS_SHA256 }
+          )
+          $digests = @()
+          foreach ($c in $components) {
+            $archive = "$($c.name)-windows-x86_64-$($c.version)-archive.zip"
+            $url = "$env:OWNED_CUDA_REDIST_BASE/$($c.name)/windows-x86_64/$archive"
+            $zip = Join-Path $env:RUNNER_TEMP $archive
+            Invoke-WebRequest -Uri $url -OutFile $zip
+            $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $c.sha256) {
+              throw "$($c.name) digest $actual does not match pinned $($c.sha256)"
+            }
+            $expanded = Join-Path $env:RUNNER_TEMP "x-$($c.name)"
+            Expand-Archive $zip -DestinationPath $expanded
+            # Each archive extracts to a single nested package directory; the
+            # toolkit root must hold bin/, include/, lib/ directly, so copy the
+            # contents of that directory rather than the directory itself.
+            Copy-Item (Join-Path $expanded '*\*') $root -Recurse -Force
+            $digests += "$($c.name)=$($c.version) sha256=$actual"
+          }
+          "CUDA_PATH=$root" >> $env:GITHUB_ENV
+          "CUDA_HOME=$root" >> $env:GITHUB_ENV
+          # bin holds the nvcc drivers; bin\x64 holds CUDA 13's runtime DLLs.
+          "PATH=$root\bin\x64;$root\bin;$env:PATH" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\synapse\build-gates" | Out-Null
+          $digests -join "`n" |
+            Set-Content "$env:GITHUB_WORKSPACE\synapse\build-gates\windows-owned-cuda-toolkit.txt"
+          & (Join-Path $root 'bin\nvcc.exe') --version
+
+      - name: Windows owned-CUDA manual build gate
+        working-directory: synapse
+        shell: pwsh
+        run: |
+          # nvcc drives the host C++ compiler (cl.exe) by name and it is not on
+          # PATH on a clean runner; cc-rs then fails before compiling anything.
+          # Locally reproduced: `nvcc fatal: Cannot find compiler 'cl.exe' in
+          # PATH`. Enter the MSVC developer environment for this shell only —
+          # a per-step import, so no later step inherits it unexpectedly.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $install = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $install) { throw 'no MSVC with VC.Tools.x86.x64 on this runner' }
+          Import-Module (Join-Path $install 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $install -SkipAutomaticLocation `
+            -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+          New-Item -ItemType Directory -Force build-gates | Out-Null
+          $command = 'cargo build -p synapse-worker-cuda --no-default-features --features cuda --release'
+          $log = 'build-gates/windows-x86_64-msvc-owned-cuda.output'
+          & cargo build -p synapse-worker-cuda --no-default-features --features cuda --release 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          $binary = 'target/release/ck-synapse-worker-cuda.exe'
+          if ($status -ne 0) {
+            $digest = 'unavailable'
+          } else {
+            $digest = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $execution = if ($status -eq 0) { 'executed_successful' } else { 'failed' }
+          @"
+          target_triple=x86_64-pc-windows-msvc
+          command=$command
+          rustc=$(rustc --version)
+          cargo=$(cargo --version)
+          cuda_version=$env:OWNED_CUDA_VERSION
+          cuda_toolkit=$(nvcc --version 2>&1 | Select-Object -Last 1)
+          cuda_component_digests=build-gates/windows-owned-cuda-toolkit.txt
+          machine_image=$env:ImageOS
+          evidence_contract=$env:LLAMA_BUILD_EVIDENCE_CONTRACT
+          binary=$binary
+          sha256=$digest
+          execution_status=$execution
+          successful_output=$log
+          readiness_matrix_trigger=workflow_dispatch
+          skipped_is_not_pass=true
+          manual_gate=mandatory
+          "@ | Set-Content build-gates/windows-x86_64-msvc-owned-cuda.txt
+          if ($status -ne 0) { exit $status }
+
+      # Hollow-green guard for the compiled backend, with no PE-inspection
+      # dependency. `--features cuda` is the only thing that makes the build
+      # link cudart/cublas, and on Windows those are LOAD-TIME imports: an
+      # exe that imports them cannot start when they are absent from PATH
+      # (STATUS_DLL_NOT_FOUND, 0xC0000135) even though its --version path
+      # never calls into them. So the same probe answers both halves:
+      #   off-PATH must FAIL with 0xC0000135 -> the CUDA backend is baked in
+      #   on-PATH  must PASS                  -> the resolved DLL set is right
+      # A worker that silently compiled CPU-only prints --version both times,
+      # which this step refuses. It also records, in CI, the sidecar fact the
+      # release/installer PR must solve: the worker is not self-contained.
+      # Caveat: the discriminator depends on cudart/cublas staying load-time
+      # imports; if a future build moves them to delay-load, the off-PATH run
+      # exits 0 and this step reports "cuda feature is not compiled" — a false
+      # failure that points at the real cause rather than hiding it.
+      - name: Assert the packaged worker really carries the CUDA backend
+        working-directory: synapse
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $exe = (Resolve-Path 'target/release/ck-synapse-worker-cuda.exe').Path
+          $isolated = Join-Path $env:RUNNER_TEMP 'cuda-isolated'
+          New-Item -ItemType Directory -Force $isolated | Out-Null
+          Copy-Item $exe $isolated
+          # PATH narrowed to the OS directories: no CUDA toolkit, no sidecars.
+          $env:PATH = "C:\Windows\system32;C:\Windows"
+          & (Join-Path $isolated 'ck-synapse-worker-cuda.exe') --version 2>&1 | Out-Null
+          $isolatedCode = $LASTEXITCODE
+          if ($isolatedCode -eq 0) {
+            throw "owned-CUDA worker ran without CUDA DLLs on PATH (exit 0): the cuda feature is not compiled into this binary — refusing to record a hollow-green gate"
+          }
+          if ($isolatedCode -ne -1073741515) {
+            throw "owned-CUDA worker failed off-PATH with exit $isolatedCode, expected -1073741515 (0xC0000135 STATUS_DLL_NOT_FOUND)"
+          }
+          # CUDA 13's redist layout keeps the runtime DLLs under bin\x64 (the
+          # nvcc drivers sit in bin); both directories are needed, as verified
+          # locally. With them restored the worker must start.
+          $env:PATH = "$env:CUDA_PATH\bin\x64;$env:CUDA_PATH\bin;C:\Windows\system32;C:\Windows"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "owned-CUDA worker --version failed with CUDA on PATH (exit $LASTEXITCODE)"
+          }
+          "cuda_import_probe=ok off_path=$isolatedCode on_path=0" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Retain Windows owned-CUDA gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owned-cuda-build-gates-windows-manual-${{ github.run_id }}
+          path: |
+            synapse/build-gates
+            synapse/target/release/ck-synapse-worker-cuda.exe
           if-no-files-found: error

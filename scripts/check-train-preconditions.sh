@@ -34,6 +34,10 @@ ALLOWED_JOB_CONDITIONS = {
         "github.event_name == 'workflow_dispatch'",
         "The Vulkan build is an explicit manual gate, not a push-triggered train gate.",
     ),
+    "windows-owned-cuda-manual": (
+        "github.event_name == 'workflow_dispatch'",
+        "The owned-CUDA Windows build is an explicit manual gate, not a push-triggered train gate.",
+    ),
 }
 PATH_CONTEXTS = ("github.ref", "github.event_name")
 
