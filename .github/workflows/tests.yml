@@ -494,19 +494,22 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
           $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$env:LLAMA_VULKAN_SDK_VERSION-Installer.exe"
-          $attempt = 0
-          while ($true) {
-            $attempt++
-            try {
-              Invoke-WebRequest -Uri $env:LLAMA_VULKAN_SDK_ARCHIVE_URL -OutFile $installer -TimeoutSec 300
-              break
-            } catch {
-              if ($attempt -ge 3) { throw "Vulkan SDK download failed after $attempt attempts: $_" }
-              Write-Host "Vulkan SDK download attempt $attempt failed, retrying: $_"
-              Remove-Item $installer -ErrorAction SilentlyContinue
-              Start-Sleep -Seconds (10 * $attempt)
-            }
-          }
+          # curl.exe rather than Invoke-WebRequest: the same URL serves this
+          # 175 MB installer fine from a developer machine and from NVIDIA's
+          # host in the sibling gate, but stalls indefinitely here. The SDK is
+          # served through a CDN that treats an unadorned PowerShell client from
+          # a datacenter range differently, so this sends a conventional
+          # user-agent and bounds every phase of the transfer. --fail turns an
+          # HTML challenge page into a non-zero exit instead of a file that then
+          # fails the digest check with a misleading message.
+          curl.exe --fail --location --silent --show-error `
+            --connect-timeout 30 --max-time 600 `
+            --retry 3 --retry-delay 15 --retry-all-errors `
+            --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' `
+            --output $installer $env:LLAMA_VULKAN_SDK_ARCHIVE_URL
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK download failed (curl exit $LASTEXITCODE)" }
+          $size = (Get-Item $installer).Length
+          Write-Host "downloaded $size bytes"
           $digest = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($digest -ne $env:LLAMA_VULKAN_SDK_ARCHIVE_SHA256) {
             throw "Vulkan SDK installer digest $digest does not match pinned $env:LLAMA_VULKAN_SDK_ARCHIVE_SHA256"
