@@ -13558,9 +13558,7 @@ fn catalog_measurement_summary(state: &ModuleState) -> CatalogMeasurementSummary
         certification_stale: lanes
             .iter()
             .any(|lane| lane.measurements.certification_stale),
-        performance_stale: lanes
-            .iter()
-            .any(|lane| lane.measurements.performance_stale),
+        performance_stale: lanes.iter().any(|lane| lane.measurements.performance_stale),
         certified_lanes: lanes
             .iter()
             .filter(|lane| lane.measurements.current_certification.is_some())
@@ -15447,8 +15445,10 @@ mod tests {
             admission_status(Arc::clone(&healthy_state)).await,
             "admission.status",
         );
-        let healthy_probe =
-            response_result(probe_report(Arc::clone(&healthy_state)).await, "probe.report");
+        let healthy_probe = response_result(
+            probe_report(Arc::clone(&healthy_state)).await,
+            "probe.report",
+        );
         assert_eq!(healthy_admission["lanes"], json!([]));
         assert_eq!(healthy_admission["catalog_lanes"], 1);
         assert_eq!(healthy_admission["certified_lanes"], 1);
