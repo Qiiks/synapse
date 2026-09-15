@@ -1818,6 +1818,19 @@ struct LaneMeasurementRows {
     performance_stale: bool,
 }
 
+struct CatalogLaneMeasurements {
+    slot: ModelSlotSnapshot,
+    certification_fingerprint: Fingerprint,
+    measurements: LaneMeasurementRows,
+}
+
+struct CatalogMeasurementSummary {
+    lanes: Vec<CatalogLaneMeasurements>,
+    certification_stale: bool,
+    performance_stale: bool,
+    certified_lanes: usize,
+}
+
 struct PerfBenchResult {
     throughput_tok_s: f64,
     cold_load_ms: f64,
@@ -13496,6 +13509,66 @@ fn lane_measurement_rows(
     }
 }
 
+fn catalog_measurement_summary(state: &ModuleState) -> CatalogMeasurementSummary {
+    let slots = state
+        .runtime
+        .catalog
+        .lock()
+        .map(|catalog| {
+            catalog
+                .values()
+                .map(|slot| ModelSlotSnapshot {
+                    spec: slot.spec.clone(),
+                    loaded: slot.loaded.clone(),
+                    state: slot.state.clone(),
+                    notify: Arc::clone(&slot.notify),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let lanes = slots
+        .into_iter()
+        .map(|slot| {
+            let certification_fingerprint = slot
+                .loaded
+                .as_ref()
+                .map(|model| model.certification_fingerprint.clone())
+                .or_else(|| {
+                    (slot.spec.engine == "owned-metal-decode")
+                        .then(|| owned_decode_catalog_entry(&slot.spec).ok())
+                        .flatten()
+                        .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
+                })
+                .unwrap_or_else(|| slot.spec.fingerprint.clone());
+            let measurements = lane_measurement_rows(
+                state,
+                &slot.spec.model_id,
+                &slot.spec.task,
+                &slot.spec.engine,
+                &certification_fingerprint,
+            );
+            CatalogLaneMeasurements {
+                slot,
+                certification_fingerprint,
+                measurements,
+            }
+        })
+        .collect::<Vec<_>>();
+    CatalogMeasurementSummary {
+        certification_stale: lanes
+            .iter()
+            .any(|lane| lane.measurements.certification_stale),
+        performance_stale: lanes
+            .iter()
+            .any(|lane| lane.measurements.performance_stale),
+        certified_lanes: lanes
+            .iter()
+            .filter(|lane| lane.measurements.current_certification.is_some())
+            .count(),
+        lanes,
+    }
+}
+
 fn lane_certification_status(
     certification_required: bool,
     evidence_certified: bool,
@@ -13650,22 +13723,12 @@ fn performance_report_row(state: &ModuleState, row: &PerfRow, stale: bool) -> Va
 }
 
 async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
-    let slots = state
-        .runtime
-        .catalog
-        .lock()
-        .map(|catalog| {
-            catalog
-                .values()
-                .map(|slot| ModelSlotSnapshot {
-                    spec: slot.spec.clone(),
-                    loaded: slot.loaded.clone(),
-                    state: slot.state.clone(),
-                    notify: Arc::clone(&slot.notify),
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let CatalogMeasurementSummary {
+        lanes: catalog_lanes,
+        certification_stale,
+        performance_stale,
+        ..
+    } = catalog_measurement_summary(&state);
     let knob_assignments = match state.store.knob_assignments(&state.machine_profile_hash) {
         Ok(assignments) => assignments,
         Err(error) => return channel_error("store_failure", error.to_string()),
@@ -13675,31 +13738,14 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
         .filter(|assignment| assignment.knob == state.runtime.knob)
         .cloned()
         .collect::<Vec<_>>();
-    let mut lanes = Vec::with_capacity(slots.len());
+    let mut lanes = Vec::with_capacity(catalog_lanes.len());
     let mut omission_records = Vec::new();
-    let mut certification_stale = false;
-    let mut performance_stale = false;
-    for slot in slots {
-        let certification_fingerprint = slot
-            .loaded
-            .as_ref()
-            .map(|model| model.certification_fingerprint.clone())
-            .or_else(|| {
-                (slot.spec.engine == "owned-metal-decode")
-                    .then(|| owned_decode_catalog_entry(&slot.spec).ok())
-                    .flatten()
-                    .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
-            })
-            .unwrap_or_else(|| slot.spec.fingerprint.clone());
-        let measurements = lane_measurement_rows(
-            &state,
-            &slot.spec.model_id,
-            &slot.spec.task,
-            &slot.spec.engine,
-            &certification_fingerprint,
-        );
-        certification_stale |= measurements.certification_stale;
-        performance_stale |= measurements.performance_stale;
+    for catalog_lane in catalog_lanes {
+        let CatalogLaneMeasurements {
+            slot,
+            certification_fingerprint,
+            measurements,
+        } = catalog_lane;
         let worker = worker_health_from_slot(&slot);
         let worker_quarantined = worker
             .as_ref()
@@ -13871,6 +13917,7 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     let execution_in_flight = execution_stats.in_flight;
     let execution_wait_p50_ms = execution_wait_percentile(&execution_stats, 0.50);
     let execution_wait_p95_ms = execution_wait_percentile(&execution_stats, 0.95);
+    let catalog_measurements = catalog_measurement_summary(&state);
     let lanes = state
         .runtime
         .loaded_models()
@@ -13899,12 +13946,6 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         })
         .collect::<Vec<_>>();
     let telemetry = state.runtime.admission_telemetry.snapshot();
-    let certification_stale = lanes
-        .iter()
-        .any(|lane| lane["certification_stale"].as_bool().unwrap_or(false));
-    let performance_stale = lanes
-        .iter()
-        .any(|lane| lane["performance_stale"].as_bool().unwrap_or(false));
     result_outcome(json!({
         "module_generation": state.module_generation,
         "machine_profile_hash": state.machine_profile_hash,
@@ -13917,8 +13958,10 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         "refusals": telemetry.refusals,
         "jobs_minted": telemetry.jobs_minted,
         "lanes": lanes,
-        "certification_stale": certification_stale,
-        "performance_stale": performance_stale,
+        "catalog_lanes": catalog_measurements.lanes.len(),
+        "certified_lanes": catalog_measurements.certified_lanes,
+        "certification_stale": catalog_measurements.certification_stale,
+        "performance_stale": catalog_measurements.performance_stale,
     }))
 }
 
@@ -15143,6 +15186,14 @@ mod tests {
         test_module_state_with_config(store, profile, ModuleConfig::default())
     }
 
+    fn response_result(outcome: HandlerOutcome, operation: &str) -> Value {
+        let HandlerOutcome::Response(response) = outcome else {
+            panic!("{operation} should return a response")
+        };
+        serde_json::from_slice::<Value>(&response).expect("operation response is JSON")["result"]
+            .clone()
+    }
+
     fn test_module_state_with_config(
         store: Arc<SynapseStore>,
         profile: MachineProfile,
@@ -15342,6 +15393,103 @@ mod tests {
 
         drop(stale_handler);
         drop(healthy_handler);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn admission_status_reports_catalog_certification_health_without_resident_lanes() {
+        let (root, descriptor) = test_storage_descriptor("admission-catalog-certification-health");
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("test store opens"));
+        let profile_a = test_machine_profile("test-os-a");
+        store
+            .observe_profile(&profile_a, 10, 1)
+            .expect("first profile activates");
+        let fingerprint = Fingerprint("test-fingerprint".to_string());
+        store
+            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
+                certification_class: CertificationClass::Embedding,
+                assurance_class: AssuranceClass::Measured,
+                status: CertificationStatus::Certified,
+                key_hash: profile_a.hash(),
+                machine_profile_hash: Some(profile_a.hash()),
+                remote_profile_hash: None,
+                identity_revision: None,
+                numeric_profile_id: Some(NumericProfileId("test-profile".to_string())),
+                fingerprint: fingerprint.clone(),
+                certified_at_ms: 11,
+                os_build: profile_a.os_build.clone(),
+                module_generation: 1,
+                evidence: json!({}),
+            })
+            .expect("current certification stores");
+        store
+            .store_perf_row(&PerfRow {
+                machine_profile_hash: profile_a.hash(),
+                model_id: "stuck-model".to_string(),
+                workload: "embed".to_string(),
+                numeric_profile_id: NumericProfileId("test-profile".to_string()),
+                fingerprint,
+                engine: "ort".to_string(),
+                measured_at_ms: 11,
+                os_build: profile_a.os_build.clone(),
+                module_generation: 1,
+                throughput_tok_s: 1.0,
+                cold_load_ms: 1.0,
+                single_item_latency_p50_ms: 1.0,
+                details: json!({}),
+            })
+            .expect("current performance row stores");
+
+        let healthy_state = test_module_state(Arc::clone(&store), profile_a);
+        assert!(healthy_state.runtime.loaded_models().is_empty());
+        let healthy_admission = response_result(
+            admission_status(Arc::clone(&healthy_state)).await,
+            "admission.status",
+        );
+        let healthy_probe =
+            response_result(probe_report(Arc::clone(&healthy_state)).await, "probe.report");
+        assert_eq!(healthy_admission["lanes"], json!([]));
+        assert_eq!(healthy_admission["catalog_lanes"], 1);
+        assert_eq!(healthy_admission["certified_lanes"], 1);
+        assert_eq!(healthy_admission["certification_stale"], json!(false));
+        assert_eq!(
+            healthy_admission["certification_stale"],
+            healthy_probe["certification_stale"]
+        );
+        assert_eq!(
+            healthy_admission["performance_stale"],
+            healthy_probe["performance_stale"]
+        );
+
+        let profile_b = test_machine_profile("test-os-b");
+        store
+            .observe_profile(&profile_b, 12, 1)
+            .expect("rotated profile activates");
+        let stale_state = test_module_state(Arc::clone(&store), profile_b);
+        assert!(stale_state.runtime.loaded_models().is_empty());
+        let stale_admission = response_result(
+            admission_status(Arc::clone(&stale_state)).await,
+            "admission.status",
+        );
+        let stale_probe =
+            response_result(probe_report(Arc::clone(&stale_state)).await, "probe.report");
+        assert_eq!(stale_admission["lanes"], json!([]));
+        assert_eq!(stale_admission["catalog_lanes"], 1);
+        assert_eq!(stale_admission["certified_lanes"], 0);
+        assert_eq!(stale_admission["certification_stale"], json!(true));
+        assert_eq!(stale_admission["performance_stale"], json!(true));
+        assert_eq!(
+            stale_admission["certification_stale"],
+            stale_probe["certification_stale"]
+        );
+        assert_eq!(
+            stale_admission["performance_stale"],
+            stale_probe["performance_stale"]
+        );
+
+        drop(stale_state);
+        drop(healthy_state);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
