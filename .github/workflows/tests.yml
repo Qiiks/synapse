@@ -117,6 +117,7 @@ jobs:
       - name: Install cargo-nextest (linux)
         if: matrix.name == 'linux'
         shell: bash
+        timeout-minutes: 10
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
       - name: Install cargo-nextest (windows)
@@ -170,6 +171,7 @@ jobs:
       - name: Download MiniLM e2e fixture
         if: steps.fixture-cache.outputs.cache-hit != 'true'
         shell: bash
+        timeout-minutes: 10
         run: |
           snap="$HOME/.cache/huggingface/hub/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/main"
           mkdir -p "$snap"
@@ -365,6 +367,7 @@ jobs:
 
       - name: Provision pinned NVIDIA CUDA toolkit
         shell: bash
+        timeout-minutes: 20
         run: |
           set -euo pipefail
           keyring="$RUNNER_TEMP/cuda-keyring_1.1-1_all.deb"
@@ -377,7 +380,12 @@ jobs:
             "$LLAMA_CUDA_TOOLKIT_PACKAGE=$LLAMA_CUDA_TOOLKIT_DEB_VERSION"
           mkdir -p "$GITHUB_WORKSPACE/synapse/build-gates"
           sha256sum "$keyring" > "$GITHUB_WORKSPACE/synapse/build-gates/linux-cuda-keyring.sha256"
-          find /var/cache/apt/archives -type f -name '*.deb' -print0 \
+          # -maxdepth 1 is load-bearing: apt's archives/partial subdirectory is
+          # root-only, so an unprivileged descent into it exits find non-zero on
+          # EACCES and pipefail kills this step after every package has already
+          # downloaded. The .deb files land directly in archives/; partial/ only
+          # ever holds in-flight downloads.
+          find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' -print0 \
             | sort -z \
             | xargs -0 -r sha256sum \
             > "$GITHUB_WORKSPACE/synapse/build-gates/linux-cuda-packages.sha256"
@@ -473,11 +481,32 @@ jobs:
         with:
           components: rustfmt
 
+      # A stalled download here previously ran for 2h26m with no output and no
+      # failure, because Invoke-WebRequest has no default timeout and the step
+      # had no bound. The timeout converts a stall into a fast, named failure;
+      # the retry covers the transient case. The SDK host sits behind a CDN that
+      # can stall a datacenter client indefinitely, which is invisible from a
+      # developer machine where the same URL serves fine.
       - name: Provision pinned Vulkan SDK archive
         shell: pwsh
+        timeout-minutes: 20
         run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
           $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$env:LLAMA_VULKAN_SDK_VERSION-Installer.exe"
-          Invoke-WebRequest -Uri $env:LLAMA_VULKAN_SDK_ARCHIVE_URL -OutFile $installer
+          $attempt = 0
+          while ($true) {
+            $attempt++
+            try {
+              Invoke-WebRequest -Uri $env:LLAMA_VULKAN_SDK_ARCHIVE_URL -OutFile $installer -TimeoutSec 300
+              break
+            } catch {
+              if ($attempt -ge 3) { throw "Vulkan SDK download failed after $attempt attempts: $_" }
+              Write-Host "Vulkan SDK download attempt $attempt failed, retrying: $_"
+              Remove-Item $installer -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds (10 * $attempt)
+            }
+          }
           $digest = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($digest -ne $env:LLAMA_VULKAN_SDK_ARCHIVE_SHA256) {
             throw "Vulkan SDK installer digest $digest does not match pinned $env:LLAMA_VULKAN_SDK_ARCHIVE_SHA256"
@@ -612,6 +641,7 @@ jobs:
 
       - name: Assemble pinned CUDA toolkit from redist archives
         shell: pwsh
+        timeout-minutes: 25
         run: |
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:RUNNER_TEMP 'cuda-owned'
