@@ -198,19 +198,6 @@ impl ModelCache {
             }
         }
 
-        let blob_path = self.blob_path(&actual_digest);
-        if !blob_path.exists() {
-            fs::rename(&temp_path, &blob_path).map_err(|source| ModelCacheError::Io {
-                action: "publish blob",
-                path: blob_path.display().to_string(),
-                source,
-            })?;
-            sync_parent(&blob_path);
-        } else {
-            before_duplicate_cleanup(&temp_path);
-            remove_file_if_absent(&temp_path, "remove duplicate temp blob")?;
-        }
-
         let sanitized_tokenizer_digest = request
             .tokenizer_path
             .as_deref()
@@ -224,6 +211,19 @@ impl ModelCache {
                 .map(|tokenizer| format!("sha256:{}", tokenizer.sanitized_sha256()))
             })
             .transpose()?;
+
+        let blob_path = self.blob_path(&actual_digest);
+        if !blob_path.exists() {
+            fs::rename(&temp_path, &blob_path).map_err(|source| ModelCacheError::Io {
+                action: "publish blob",
+                path: blob_path.display().to_string(),
+                source,
+            })?;
+            sync_parent(&blob_path);
+        } else {
+            before_duplicate_cleanup(&temp_path);
+            remove_file_if_absent(&temp_path, "remove duplicate temp blob")?;
+        }
 
         let mut meta = match self.read_meta(&actual_digest) {
             Ok(mut existing) => {
@@ -254,7 +254,9 @@ impl ModelCache {
 
     pub fn pin(&self, digest: &str, module_id: &str) -> Result<ModelCacheMeta, ModelCacheError> {
         self.ensure_layout()?;
-        let mut meta = self.read_meta(digest)?;
+        let normalized = normalize_digest(digest)?;
+        let _lease = self.leases.acquire(&lease_key(&normalized))?;
+        let mut meta = self.read_meta(&normalized)?;
         add_pin(&mut meta.pins, module_id.to_string());
         meta.tombstone = None;
         self.write_meta(&meta)?;
@@ -733,6 +735,30 @@ mod tests {
     }
 
     #[test]
+    fn ingest_rejects_invalid_tokenizer_without_publishing_blob() {
+        let root = temp_root("invalid-tokenizer");
+        let cache = ModelCache::new(&root);
+        let source = root.join("source.bin");
+        let tokenizer = root.join("tokenizer.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, b"artifact-b").unwrap();
+        fs::write(&tokenizer, b"not tokenizer json").unwrap();
+
+        let error = cache
+            .ingest(ModelCacheIngest {
+                source_url: format!("file://{}", source.display()),
+                expected_digest: None,
+                format: "bin".to_string(),
+                tokenizer_path: Some(tokenizer),
+                pin_module_id: None,
+            })
+            .expect_err("invalid tokenizer should reject");
+
+        assert!(matches!(error, ModelCacheError::Tokenizer(_)));
+        assert!(fs::read_dir(root.join(BLOBS_DIR)).unwrap().next().is_none());
+    }
+
+    #[test]
     fn ingest_cleans_stale_temp_and_preserves_fresh_foreign_temp() {
         let root = temp_root("crash-safe-ingest");
         let tmp = root.join(TMP_DIR);
@@ -813,6 +839,26 @@ mod tests {
             }
         );
         assert!(cache.blob_path(&meta.digest).exists());
+    }
+
+    #[test]
+    fn digest_lease_blocks_pin_metadata_mutation() {
+        let (cache, meta) = ingest_fixture("reader-pin", b"artifact-d", None);
+        let _read_guard = cache
+            .acquire_read(&meta.digest)
+            .expect("reader should acquire shared lease");
+
+        assert!(matches!(
+            cache.pin(&meta.digest, "synapse"),
+            Err(ModelCacheError::Lease(
+                cortexkit_lease::LeaseError::Held { .. }
+            ))
+        ));
+        assert!(cache
+            .read_meta(&meta.digest)
+            .expect("metadata should remain readable")
+            .pins
+            .is_empty());
     }
 
     #[test]

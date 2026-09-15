@@ -3321,6 +3321,10 @@ fn session_request_key(session_id: &str, req_id: &str) -> String {
     format!("{session_id}:{req_id}")
 }
 
+fn absolute_serving_boundary(previous: u64, request_committed: u32) -> u64 {
+    previous.saturating_add(request_committed.into())
+}
+
 async fn owned_decode_admit_session(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let params: OwnedDecodeSessionAdmissionParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -3999,6 +4003,25 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
             "worker exceeded the admitted generation limit",
         );
     }
+    let committed_before_request = match state.store.serving_session(&params.session_id) {
+        Ok(Some(session)) => session.committed_token_count,
+        Ok(None) => {
+            clear_owned_decode_request(&state, &params.session_id, &params.req_id);
+            return owned_decode_failure(
+                &state,
+                "store_failure",
+                "the durable decode session does not exist",
+            );
+        }
+        Err(error) => {
+            clear_owned_decode_request(&state, &params.session_id, &params.req_id);
+            return owned_decode_failure(
+                &state,
+                "store_failure",
+                format!("could not read the decode session boundary: {error}"),
+            );
+        }
+    };
 
     let mut sessions = match state.runtime.owned_decode_sessions.lock() {
         Ok(sessions) => sessions,
@@ -4079,7 +4102,7 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
         }
         match state.store.commit_serving_session_boundary(
             &params.session_id,
-            committed.into(),
+            absolute_serving_boundary(committed_before_request, committed),
             now_ms(),
         ) {
             Ok(store::ServingBoundaryOutcome::Continue { .. }) => {}
@@ -6022,6 +6045,34 @@ fn io_to_load_error(action: &str, path: &Path, source: &std::io::Error) -> WireO
     transient_model_load_error(format!("{action} {}: {source}", path.display()))
 }
 
+struct ModelLoadScratch {
+    path: PathBuf,
+}
+
+impl ModelLoadScratch {
+    fn create(path: PathBuf) -> std::io::Result<Self> {
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ModelLoadScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn model_load_scratch_path(job_id: &str) -> PathBuf {
+    env::temp_dir().join(format!(
+        "synapse-model-load-{}-{job_id}",
+        std::process::id()
+    ))
+}
+
 async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params: ModelLoadParams) {
     if !matches!(
         state
@@ -6035,13 +6086,10 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
 
     let result = async {
         let sources = resolve_model_load_sources(&params).map_err(artifact_invalid_error)?;
-        let temp_dir = env::temp_dir().join(format!(
-            "synapse-model-load-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        fs::create_dir_all(&temp_dir)
+        let temp_dir = model_load_scratch_path(&job_id);
+        let scratch = ModelLoadScratch::create(temp_dir.clone())
             .map_err(|error| io_to_load_error("create temp directory", &temp_dir, &error))?;
+        let temp_dir = scratch.path();
         let model_path = temp_dir.join("model.bin");
         let tokenizer_path = temp_dir.join("tokenizer.json");
         let config_path = sources
@@ -6165,7 +6213,7 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             }
             Some(
                 owned_catalog_config(
-                    &temp_dir,
+                    temp_dir,
                     params.family.as_deref(),
                     params.dtype.as_deref(),
                     params.execution.as_deref(),
@@ -6219,7 +6267,6 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             "model_id": loaded.model_id,
             "fingerprint": loaded.fingerprint,
         });
-        let _ = fs::remove_dir_all(&temp_dir);
         Ok::<_, WireOperationError>(result)
     }
     .await;
@@ -16025,6 +16072,36 @@ mod tests {
         assert_eq!(error.class, ErrorClass::Permanent);
         assert_eq!(error.retry_after_ms, None);
         assert!(!error.safe_to_retry_same_request);
+    }
+
+    #[test]
+    fn concurrent_model_load_jobs_use_distinct_scratch_paths() {
+        assert_ne!(
+            model_load_scratch_path("job_first"),
+            model_load_scratch_path("job_second")
+        );
+    }
+
+    #[test]
+    fn second_decode_request_extends_the_absolute_session_boundary() {
+        assert_eq!(absolute_serving_boundary(11, 4), 15);
+    }
+
+    #[test]
+    fn model_load_scratch_removes_downloads_when_scope_exits() {
+        let path = env::temp_dir().join(format!(
+            "synapse-model-load-scratch-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        {
+            let scratch =
+                ModelLoadScratch::create(path.clone()).expect("create model-load scratch");
+            fs::write(scratch.path().join("model.bin"), b"downloaded model")
+                .expect("write scratch download");
+        }
+
+        assert!(!path.exists(), "scratch directory survived guard drop");
     }
 
     #[test]
