@@ -183,12 +183,23 @@ pub struct ReleaseEvidence {
     pub wire_binding_revision: String,
 }
 
-/// Whether the release evidence set permits shipping: every gate passed.
+/// Whether the release evidence set permits shipping: every gate is PRESENT
+/// and passed.
+///
+/// Presence is checked as well as status because `all()` over an empty map is
+/// true, so a bare status check answers "every gate passed" with "yes" for
+/// evidence that contains no gates at all. On a predicate that authorises
+/// shipping, an absent gate set is the one input that must never read as
+/// success: a caller that failed to collect evidence, or collected it into the
+/// wrong structure, would otherwise be told it may ship. Requiring the full
+/// `ALL_GATES` set makes missing evidence a refusal rather than a pass.
 pub fn release_ready(evidence: &ReleaseEvidence) -> bool {
-    evidence
-        .gate_statuses
-        .values()
-        .all(|status| matches!(status, GateStatus::Passed { .. }))
+    ALL_GATES.iter().all(|gate| {
+        matches!(
+            evidence.gate_statuses.get(gate),
+            Some(GateStatus::Passed { .. })
+        )
+    })
 }
 
 /// Gates carrying a `Skipped` status. Must be empty for any real run: every
@@ -1627,6 +1638,48 @@ mod tests {
             GateRunner::gate_11_scheduler(&committed),
             GateStatus::Passed { .. }
         ));
+    }
+
+    #[test]
+    fn release_ready_refuses_evidence_carrying_no_gates() {
+        // `all()` over an empty map is true, so a status-only check answers
+        // "every gate passed" for evidence that contains no gates at all. On a
+        // predicate that authorises shipping, absent evidence must refuse.
+        let empty = ReleaseEvidence {
+            fixture_registry_revision: String::new(),
+            executed_fixtures: BTreeMap::new(),
+            certification_evidence_ids: Vec::new(),
+            gate_statuses: BTreeMap::new(),
+            scheduler_status: SchedulerEvidenceStatus::Committed { production_n: 16 },
+            ci_lane_revision: String::new(),
+            wire_binding_revision: String::new(),
+        };
+        assert!(
+            !release_ready(&empty),
+            "evidence with no gates must not read as shippable"
+        );
+    }
+
+    #[test]
+    fn release_ready_refuses_a_gate_set_missing_one_gate() {
+        // The subtler case: every gate PRESENT has passed, but one is absent.
+        // A status-only check passes this too, because the missing gate is
+        // never inspected.
+        let runner = GateRunner::new(manifest_dir());
+        let battery = parity_battery();
+        let mut oracle = OracleStore::new();
+        oracle.register_synthetic_battery(&battery);
+        let mut probe = OracleReproducingProbe::new(&oracle);
+        let throughput = four_lane_throughput();
+        let grammar_cost = passing_grammar_cost();
+        let mut evidence = runner.run_all(&oracle, &mut probe, &throughput, Some(&grammar_cost));
+        assert!(release_ready(&evidence));
+
+        evidence.gate_statuses.remove(&GateId::GDec11);
+        assert!(
+            !release_ready(&evidence),
+            "a gate set missing a gate must not read as shippable"
+        );
     }
 
     #[test]
