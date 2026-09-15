@@ -49,6 +49,10 @@ impl Q8_0Tensor {
     pub fn quantize(values: &[f32], row_width: usize) -> Result<Self> {
         ensure!(row_width > 0, "Q8_0 matrix row width must be positive");
         ensure!(
+            !values.is_empty(),
+            "Q8_0 matrix must contain at least one row"
+        );
+        ensure!(
             row_width % Q8_0_BLOCK_ELEMENTS == 0,
             "Q8_0 matrix row width {row_width} is not divisible by {Q8_0_BLOCK_ELEMENTS}"
         );
@@ -103,6 +107,15 @@ pub(crate) fn quantized_sha256<'a>(weights: impl IntoIterator<Item = &'a Q8_0Ten
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q8_0_rejects_empty_matrix() {
+        let error = Q8_0Tensor::quantize(&[], 32).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Q8_0 matrix must contain at least one row"
+        );
+    }
 
     #[test]
     fn q8_0_bytes_match_the_gguf_block_layout() {
