@@ -180,10 +180,15 @@ reported Neural Engine share across its buckets.
   write-commit when your index holds mixed provenance. Revocation is never
   retroactive: vectors written under a certified fingerprint stay readable;
   demotion affects the future only.
-- **admission.status** — advisory snapshot: queue depths, per-lane
-  meeting_deadlines + rolling p50 start-delay, current knob, and
-  certification/perf staleness for loaded lanes. The contract lives in
-  per-request budgets, not this snapshot.
+- **admission.status** — advisory snapshot: queue depths, current knob, and
+  catalog-wide certification/performance health. Top-level `catalog_lanes`
+  counts every known lane, while `certified_lanes` counts lanes with
+  certification evidence for the current machine profile. Top-level
+  `certification_stale` and `performance_stale` scan the full catalog, including
+  unloaded lanes. The `lanes` array remains resident-only because its
+  `meeting_deadlines`, rolling start-delay, waiter, and in-flight values describe
+  live execution state. The contract lives in per-request budgets, not this
+  snapshot.
 - **cache.pin / cache.gc** — model cache management (content-addressed,
   shared-lease readers, two-phase GC; GC never deletes under a live reader
   or a foreign pin).
