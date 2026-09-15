@@ -8399,7 +8399,12 @@ fn owned_decode_quarantined(
         &decode_fingerprint.0,
         runtime_config_digest,
     );
-    budget.is_quarantined(&key, 0)
+    // The clock is load-bearing: `is_quarantined` answers `now < until`, so a
+    // zero here makes any positive expiry true forever and the routing gate can
+    // never clear, while the dispatch path in worker_host asks the same
+    // predicate with a real clock and sees the quarantine expire. Two call
+    // sites of one predicate must not disagree about time.
+    budget.is_quarantined(&key, now_ms())
 }
 
 #[cfg(target_os = "macos")]
@@ -15392,6 +15397,60 @@ mod tests {
         drop(stale_handler);
         drop(healthy_handler);
         drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_decode_quarantine_precheck_honours_the_wall_clock() {
+        // The routing precheck and the dispatch path in worker_host ask the
+        // same predicate. `is_quarantined` answers `now < until`, so a zero
+        // clock in the precheck reports every past expiry as still blocking
+        // while dispatch sees it cleared. This pins the precheck to a real
+        // clock by asserting the two answers agree for an expired record.
+        use owned_decode_worker::budget::{
+            BudgetPolicy, CrashBudget as OwnedCrashBudget, FileBudgetStore,
+        };
+        use owned_decode_worker::error::FailureClassification;
+        use owned_decode_worker::identity::QuarantineKey;
+
+        let root = std::env::temp_dir().join(format!(
+            "synapse-quarantine-clock-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("budget directory");
+        let store = FileBudgetStore::open(root.join("budget.json")).expect("budget store opens");
+        let policy = BudgetPolicy::default();
+        let mut budget = OwnedCrashBudget::new(store, policy);
+        let key = QuarantineKey::new("profile-hash", "decode-fingerprint", "config-digest");
+
+        // Charge far enough in the past that the quarantine window has closed.
+        let charged_at = now_ms()
+            .saturating_sub(policy.quarantine_duration_ms)
+            .saturating_sub(60_000);
+        let mut outcome = None;
+        for _ in 0..policy.max_strikes {
+            outcome = Some(
+                budget
+                    .charge(&key, FailureClassification::Crash, charged_at)
+                    .expect("charge persists"),
+            );
+        }
+        assert!(
+            outcome.expect("at least one charge").quarantined,
+            "the budget must be exhausted for this fixture to mean anything"
+        );
+
+        assert!(
+            !budget.is_quarantined(&key, now_ms()),
+            "an expired quarantine must not block under the real clock"
+        );
+        assert!(
+            budget.is_quarantined(&key, 0),
+            "a zero clock reports the same expired quarantine as blocking; this \
+             is why the precheck must not pass zero"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
