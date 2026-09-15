@@ -14265,6 +14265,18 @@ fn ane_materialization_cache_error(error: anyhow::Error) -> ModelCacheError {
 }
 
 fn cache_error_to_wire(error: ModelCacheError) -> WireOperationError {
+    // A held digest lease is the one transient member of this error set: pin and
+    // gc now serialize on the same lease, so a pin that arrives while a reader
+    // or a sweep holds it is refused for timing reasons alone and succeeds on a
+    // retry. Mapping it to artifact_invalid like the rest would tell a caller
+    // its artifact is permanently broken and must not be retried, which is the
+    // opposite of the truth and would strand a healthy blob.
+    if matches!(error, ModelCacheError::Lease(_)) {
+        return WireOperationError::from_stable(
+            StableError::queue_full(Some(250)),
+            error.to_string(),
+        );
+    }
     WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string())
 }
 
@@ -15445,6 +15457,32 @@ mod tests {
         drop(healthy_handler);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_held_cache_lease_is_reported_as_retryable_not_invalid() {
+        // pin and gc serialize on one digest lease, so a pin refused for
+        // contention is a timing failure, not a broken artifact. Reporting it
+        // as artifact_invalid would tell the caller never to retry a blob that
+        // is fine.
+        let held = ModelCacheError::Lease(cortexkit_lease::LeaseError::Held {
+            key: cortexkit_lease::LeaseKey::new("synapse", "model-cache", "digest"),
+        });
+        let wire = cache_error_to_wire(held);
+        assert_eq!(wire.class, ErrorClass::Transient);
+        assert!(
+            wire.retry_after_ms.is_some(),
+            "a transient refusal must carry a retry hint"
+        );
+        assert!(wire.safe_to_retry_same_request);
+
+        let invalid = ModelCacheError::NotFound("digest".to_string());
+        let wire = cache_error_to_wire(invalid);
+        assert_eq!(
+            wire.class,
+            ErrorClass::Permanent,
+            "non-lease cache errors keep the permanent classification"
+        );
     }
 
     #[test]
