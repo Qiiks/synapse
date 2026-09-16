@@ -14721,7 +14721,7 @@ fn load_module_config_with_environment(
     if let Some(path) = env_var(SYNAPSE_CONFIG_PATH_ENV) {
         return load_module_config_file(&PathBuf::from(path), ConfigTier::User);
     }
-    let user_path = default_synapse_config_path_with_environment(&mut env_var);
+    let user_path = default_synapse_config_path(cortexkit_store_types::resolve_config_home())?;
     if let Some(cwd) = cwd {
         let project_path = cwd.join(".cortexkit").join("synapse.jsonc");
         if project_path.is_file() {
@@ -14739,47 +14739,17 @@ fn load_module_config_with_environment(
     Ok(ModuleConfig::default())
 }
 
-// Use the daemon's config-home precedence so both processes select the same root.
-// Re-derived from `subc-core/src/daemon_config.rs::default_config_path` at subconscious
-// commit d5e09914b0791a66f2a5a00a9bb3422860ade95e (2026-09-06); Synapse appends its
-// own filename, and future convention changes should be re-derived from that function.
-fn default_synapse_config_path_with_environment(
-    env_var: &mut impl FnMut(&str) -> Option<OsString>,
-) -> PathBuf {
-    let mut non_empty_os_var = |key| env_var(key).filter(|value| !value.is_empty());
-
-    if let Some(config_home) = non_empty_os_var("XDG_CONFIG_HOME") {
-        return PathBuf::from(config_home)
-            .join("cortexkit")
-            .join("synapse.jsonc");
+// The shared resolver owns precedence; reject cwd-relative roots before joining
+// so a missing home cannot silently select a project's user-tier configuration.
+fn default_synapse_config_path(config_home: String) -> Result<PathBuf, ModuleError> {
+    let config_home = PathBuf::from(config_home);
+    if !config_home.is_absolute() {
+        return Err(ModuleError::Config(format!(
+            "config home {} is relative; set XDG_CONFIG_HOME to an absolute path (or provide an absolute HOME / Windows APPDATA or USERPROFILE)",
+            config_home.display()
+        )));
     }
-
-    #[cfg(windows)]
-    {
-        if let Some(app_data) = non_empty_os_var("APPDATA") {
-            return PathBuf::from(app_data)
-                .join("cortexkit")
-                .join("synapse.jsonc");
-        }
-        if let Some(user_profile) = non_empty_os_var("USERPROFILE") {
-            return PathBuf::from(user_profile)
-                .join("AppData")
-                .join("Roaming")
-                .join("cortexkit")
-                .join("synapse.jsonc");
-        }
-    }
-
-    if let Some(home) = non_empty_os_var("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("cortexkit")
-            .join("synapse.jsonc");
-    }
-
-    PathBuf::from(".config")
-        .join("cortexkit")
-        .join("synapse.jsonc")
+    Ok(config_home.join("cortexkit").join("synapse.jsonc"))
 }
 
 #[derive(Clone, Copy)]
@@ -16415,7 +16385,6 @@ mod tests {
         ));
         let xdg_home = root.join("xdg");
         let home = root.join("home");
-        let project = root.join("project");
         let xdg_config = xdg_home.join("cortexkit").join("synapse.jsonc");
         let home_config = home.join(".config").join("cortexkit").join("synapse.jsonc");
         fs::create_dir_all(xdg_config.parent().expect("XDG config parent")).unwrap();
@@ -16423,35 +16392,76 @@ mod tests {
         fs::write(&xdg_config, r#"{"cache_max_bytes": 111}"#).unwrap();
         fs::write(&home_config, r#"{"cache_max_bytes": 222}"#).unwrap();
 
-        let xdg = load_module_config_with_environment(
-            |key| match key {
-                "XDG_CONFIG_HOME" => Some(xdg_home.clone().into_os_string()),
-                "HOME" => Some(home.clone().into_os_string()),
-                _ => None,
-            },
-            Some(&project),
-        )
-        .expect("load XDG config");
-        assert_eq!(xdg.cache_max_bytes, 111);
-
-        let home_only = load_module_config_with_environment(
-            |key| match key {
-                "HOME" => Some(home.clone().into_os_string()),
-                _ => None,
-            },
-            Some(&project),
-        )
-        .expect("load HOME config");
-        assert_eq!(home_only.cache_max_bytes, 222);
-
-        let mut no_environment = |_: &str| -> Option<OsString> { None };
-        assert_eq!(
-            default_synapse_config_path_with_environment(&mut no_environment),
-            PathBuf::from(".config")
-                .join("cortexkit")
-                .join("synapse.jsonc")
-        );
+        config_home_subprocess(Some(&xdg_home), Some(&home), "111");
+        config_home_subprocess(None, Some(&home), "222");
+        config_home_subprocess(Some(Path::new("")), Some(&home), "222");
+        config_home_subprocess(None, None, "relative-error");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // The shared resolver reads process environment and has no injectable variant.
+    // Isolate its inputs in a child test process rather than racing parallel tests.
+    fn config_home_subprocess(xdg: Option<&Path>, home: Option<&Path>, expected: &str) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "tests::config_home_subprocess_probe",
+            "--nocapture",
+        ]);
+        for key in [
+            "XDG_CONFIG_HOME",
+            "HOME",
+            "APPDATA",
+            "USERPROFILE",
+            SYNAPSE_CONFIG_PATH_ENV,
+        ] {
+            command.env_remove(key);
+        }
+        if let Some(xdg) = xdg {
+            command.env("XDG_CONFIG_HOME", xdg);
+        }
+        if let Some(home) = home {
+            command.env("HOME", home);
+        }
+        let output = command
+            .env("SYNAPSE_TEST_CONFIG_HOME_EXPECTED", expected)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn config_home_subprocess_probe() {
+        let Ok(expected) = std::env::var("SYNAPSE_TEST_CONFIG_HOME_EXPECTED") else {
+            return;
+        };
+        let result = load_module_config_with_environment(|key| env::var_os(key), None);
+        if expected == "relative-error" {
+            let error = result.expect_err("relative config home must be refused");
+            assert!(matches!(error, ModuleError::Config(_)));
+            assert!(error.to_string().contains("XDG_CONFIG_HOME"));
+            assert!(error.to_string().contains("relative"));
+        } else {
+            assert_eq!(
+                result.unwrap().cache_max_bytes,
+                expected.parse::<u64>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn relative_xdg_config_home_is_refused() {
+        config_home_subprocess(
+            Some(Path::new("relative-config")),
+            Some(&std::env::temp_dir()),
+            "relative-error",
+        );
     }
 
     #[test]

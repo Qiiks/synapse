@@ -1483,10 +1483,22 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-log"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
- "cortexkit-store-types",
+ "cortexkit-store-types 0.2.2",
+ "regex",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "cortexkit-log"
+version = "0.2.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
+dependencies = [
+ "chrono",
+ "cortexkit-store-types 0.2.1",
  "regex",
  "tracing",
  "tracing-subscriber",
@@ -1503,13 +1515,21 @@ name = "cortexkit-store"
 version = "0.2.0"
 dependencies = [
  "cortexkit-lease",
- "cortexkit-store-types",
+ "cortexkit-store-types 0.2.2",
  "rusqlite",
 ]
 
 [[package]]
 name = "cortexkit-store-types"
 version = "0.2.1"
+source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cortexkit-store-types"
+version = "0.2.2"
 dependencies = [
  "serde",
 ]
@@ -6658,7 +6678,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -6667,9 +6687,10 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.17.39"
+version = "0.17.45"
 dependencies = [
  "base64 0.22.1",
+ "cortexkit-log 0.2.0 (git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f)",
  "cortexkit-paths",
  "ed25519-dalek",
  "fs4",
@@ -6832,9 +6853,9 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "cortexkit-lease",
- "cortexkit-log",
+ "cortexkit-log 0.2.0",
  "cortexkit-store",
- "cortexkit-store-types",
+ "cortexkit-store-types 0.2.2",
  "half",
  "hex",
  "httpdate",
