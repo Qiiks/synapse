@@ -25,8 +25,8 @@ pub fn worker_binary_file_name(engine: &str) -> Option<&'static str> {
         LLAMA_ENGINE => Some("ck-synapse-worker-llama"),
         "mlx" => Some("ck-synapse-worker-mlx"),
         "ane" => Some("ck-synapse-worker-ane"),
-        "owned-cuda" => Some("ck-synapse-worker-cuda"),
-        "owned-metal-decode" => Some("ck-synapse-worker-decode"),
+        CUDA_WORKER_ENGINE => Some("ck-synapse-worker-cuda"),
+        DECODE_WORKER_ENGINE => Some("ck-synapse-worker-decode"),
         _ => None,
     }
 }
