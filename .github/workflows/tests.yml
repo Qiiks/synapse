@@ -208,8 +208,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          metadata=$(cargo metadata --no-deps --format-version 1)
-          members=$(jq -r '.workspace_members as $members | .packages[] | select(.id as $id | $members | index($id)) | .name' <<< "$metadata")
+          # `cargo fmt --all` follows path dependencies OUT of the workspace, so it
+          # formatted-checked ../commons and ../subconscious from here and could
+          # fail this job on a sibling's mid-edit file. Enumerate our own members
+          # and pass them explicitly. cargo tree is used rather than jq over
+          # cargo metadata because jq is not present on the windows runner and
+          # this step must behave identically on every leg.
+          members=$(cargo tree --workspace --depth 0 --prefix none | awk 'NF { print $1 }' | sort -u)
           packages=()
           while IFS= read -r member; do
             if [[ -n "$member" ]]; then
@@ -217,7 +222,7 @@ jobs:
             fi
           done <<< "$members"
           if (( ${#packages[@]} == 0 )); then
-            echo "error: cargo metadata returned an empty workspace member list; refusing vacuous fmt check" >&2
+            echo "error: cargo tree returned an empty workspace member list; refusing vacuous fmt check" >&2
             exit 1
           fi
           echo "Formatting $((${#packages[@]} / 2)) workspace members"
