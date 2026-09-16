@@ -177,14 +177,22 @@ fn load_safetensor_map(root: &Path, original: &Path) -> Result<HashMap<String, T
 }
 
 fn load_safetensors_file(path: &Path) -> Result<HashMap<String, Tensor>> {
-    // Map instead of reading: the file is large and every tensor is copied out
-    // into its own buffer below, so the whole-file `Vec<u8>` would only ever be
-    // a transient second copy of the model in host RAM.
-    let file = fs::File::open(path).with_context(|| format!("open safetensors {}", path.display()))?;
-    // SAFETY: the file is opened read-only and is not mutated or truncated while
-    // the mapping is alive (it is dropped at the end of this function).
-    let bytes = unsafe { memmap2::Mmap::map(&file) }
-        .with_context(|| format!("mmap safetensors {}", path.display()))?;
+    // The CUDA build maps instead of reading: the file is large and every
+    // tensor is copied out into its own buffer below, so the whole-file
+    // `Vec<u8>` would only ever be a transient second copy of the model in
+    // host RAM. The non-CUDA build cannot use `unsafe` here because the crate
+    // forbids it outside the `cuda` feature, so it keeps the plain read.
+    #[cfg(feature = "cuda")]
+    let bytes = {
+        let file =
+            fs::File::open(path).with_context(|| format!("open safetensors {}", path.display()))?;
+        // SAFETY: the file is opened read-only and is not mutated or truncated
+        // while the mapping is alive (it is dropped at the end of this function).
+        unsafe { memmap2::Mmap::map(&file) }
+            .with_context(|| format!("mmap safetensors {}", path.display()))?
+    };
+    #[cfg(not(feature = "cuda"))]
+    let bytes = fs::read(path).with_context(|| format!("read safetensors {}", path.display()))?;
     let tensors = SafeTensors::deserialize(&bytes)
         .map_err(|error| anyhow::anyhow!("load safetensors {}: {error}", path.display()))?;
     let mut result = HashMap::new();
