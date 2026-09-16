@@ -3980,3 +3980,127 @@ fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
         }
     }
 }
+
+#[tokio::test]
+async fn admission_status_tracks_job_counters_over_wire() {
+    let provider = RemoteMockProvider::start().await;
+    let config = serde_json::json!({
+        "inline": {"max_items": 1, "max_tokens": 8192},
+        "remote_providers": [{
+            "name": "mock",
+            "base_url": provider.base_url(),
+            "adapter": {"kind": "openai_compatible"},
+            "auth": {"kind": "none"},
+            "models": [{
+                "synapse_model_id": "remote-embed-wire-telemetry",
+                "task": "embed",
+                "model": "mock-embed",
+                "identity_revision": "r1",
+                "dims": 3,
+                "input_profile_id": "whitespace-v1",
+                "max_input_tokens": 128,
+                "sentinel_texts": ["alpha", "beta", "gamma"]
+            }],
+            "breaker": {"failure_threshold": 3, "cooldown_ms": 100},
+            "cold_estimate_ms": {"embed": 10, "rerank": 10, "generate": 10},
+            "connect_timeout_ms": 1000,
+            "read_timeout_ms": 1000,
+            "target_subbatch_ms": 100
+        }]
+    })
+    .to_string();
+    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+
+    // Certify the remote model so embed.batch is accepted
+    run_probe_job(
+        &mut consumer,
+        route,
+        1,
+        serde_json::json!({"models": ["remote-embed-wire-telemetry"], "request_key": "remote-probe"}),
+    )
+    .await;
+
+    // Snapshot before batch job
+    let before_status = route_request(
+        &mut consumer,
+        route,
+        10,
+        serde_json::json!({"method": "admission.status"}),
+    )
+    .await;
+    let before = &before_status["result"];
+    let before_minted = before["jobs_minted"].as_u64().expect("jobs_minted is u64");
+    let before_completed = before["jobs_completed"]
+        .as_u64()
+        .expect("jobs_completed is u64");
+    let before_failed = before["jobs_failed"].as_u64().expect("jobs_failed is u64");
+    let before_inherited = before["jobs_inherited"]
+        .as_u64()
+        .expect("jobs_inherited is u64");
+    let before_open = before["jobs_open"].as_u64().expect("jobs_open is u64");
+    assert_eq!(
+        before_open,
+        (before_minted + before_inherited)
+            .saturating_sub(before_completed)
+            .saturating_sub(before_failed)
+    );
+
+    // Submit embed.batch job with items exceeding max_items: 1 so it admits a durable job
+    let accepted = route_request(
+        &mut consumer,
+        route,
+        11,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": {
+                "model": "remote-embed-wire-telemetry",
+                "request_key": "wire-telemetry-batch-key",
+                "accept_declared": true,
+                "items": [
+                    {"id": "item-1", "text": "hello wire world"},
+                    {"id": "item-2", "text": "second item for durable job"}
+                ]
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"]
+        .as_str()
+        .expect("job_id returned");
+
+    // Poll until completed
+    let completed = poll_embed_result(&mut consumer, route, 12, job_id).await;
+    assert_eq!(completed["result"]["state"], "done");
+
+    // Snapshot after job
+    let after_status = route_request(
+        &mut consumer,
+        route,
+        13,
+        serde_json::json!({"method": "admission.status"}),
+    )
+    .await;
+    let after = &after_status["result"];
+    let minted = after["jobs_minted"].as_u64().expect("jobs_minted is u64");
+    let completed_count = after["jobs_completed"]
+        .as_u64()
+        .expect("jobs_completed is u64");
+    let failed_count = after["jobs_failed"].as_u64().expect("jobs_failed is u64");
+    let inherited_count = after["jobs_inherited"]
+        .as_u64()
+        .expect("jobs_inherited is u64");
+    let open_count = after["jobs_open"].as_u64().expect("jobs_open is u64");
+
+    assert_eq!(minted, before_minted + 1);
+    assert_eq!(completed_count, before_completed + 1);
+    assert_eq!(failed_count, before_failed);
+    assert_eq!(inherited_count, before_inherited);
+    // Identity holds
+    assert_eq!(
+        open_count,
+        (minted + inherited_count)
+            .saturating_sub(completed_count)
+            .saturating_sub(failed_count)
+    );
+    assert_eq!(open_count, 0);
+}

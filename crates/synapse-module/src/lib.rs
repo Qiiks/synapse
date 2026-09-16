@@ -965,11 +965,18 @@ struct AdmissionRefusalCounter {
 struct AdmissionTelemetrySnapshot {
     refusals: BTreeMap<String, AdmissionRefusalCounter>,
     jobs_minted: u64,
+    jobs_completed: u64,
+    jobs_failed: u64,
+    jobs_inherited: u64,
+    jobs_open: u64,
 }
 
 #[derive(Default)]
 struct AdmissionTelemetry {
     jobs_minted: AtomicU64,
+    jobs_completed: AtomicU64,
+    jobs_failed: AtomicU64,
+    jobs_inherited: AtomicU64,
     refusals: Mutex<BTreeMap<String, AdmissionRefusalCounter>>,
 }
 
@@ -991,14 +998,46 @@ impl AdmissionTelemetry {
         self.jobs_minted.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_job_completed(&self) {
+        self.jobs_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_job_failed(&self) {
+        self.jobs_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_jobs_failed(&self, count: u64) {
+        self.jobs_failed.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_job_inherited(&self) {
+        self.jobs_inherited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_jobs_inherited(&self, count: u64) {
+        self.jobs_inherited.fetch_add(count, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> AdmissionTelemetrySnapshot {
+        let jobs_minted = self.jobs_minted.load(Ordering::Relaxed);
+        let jobs_completed = self.jobs_completed.load(Ordering::Relaxed);
+        let jobs_failed = self.jobs_failed.load(Ordering::Relaxed);
+        let jobs_inherited = self.jobs_inherited.load(Ordering::Relaxed);
+        let jobs_open = jobs_minted
+            .saturating_add(jobs_inherited)
+            .saturating_sub(jobs_completed)
+            .saturating_sub(jobs_failed);
         AdmissionTelemetrySnapshot {
             refusals: self
                 .refusals
                 .lock()
                 .map(|refusals| refusals.clone())
                 .unwrap_or_default(),
-            jobs_minted: self.jobs_minted.load(Ordering::Relaxed),
+            jobs_minted,
+            jobs_completed,
+            jobs_failed,
+            jobs_inherited,
+            jobs_open,
         }
     }
 }
@@ -1889,15 +1928,6 @@ impl SynapseHandler {
         let descriptor = resolve_storage_descriptor(&ack.storage, &self.inner.module_id)?;
         let store = Arc::new(SynapseStore::open(&descriptor)?);
         let module_generation = store.next_module_generation()?;
-        let restart_error = WireOperationError::from_stable(
-            StableError::module_restarted(),
-            "module restarted before the durable job reached a terminal result",
-        );
-        store.fail_prior_generation_incomplete_jobs(
-            module_generation,
-            &serde_json::to_value(&restart_error).expect("restart error serializes"),
-            now_ms(),
-        )?;
         let config = load_module_config()?;
         let configured_remote =
             validate_remote_providers(&config.remote_providers).map_err(ModuleError::Config)?;
@@ -1934,6 +1964,7 @@ impl SynapseHandler {
             .map_err(|error| ModuleError::Config(error.message))?,
         );
         let runtime = Arc::new(RuntimeState::from_catalog(config, catalog_models)?);
+        reconcile_startup_orphans(&store, module_generation, &runtime.admission_telemetry)?;
         let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
         Ok(Arc::new(ModuleState {
             module_id: self.inner.module_id.clone(),
@@ -1950,6 +1981,27 @@ impl SynapseHandler {
             remote_gateway,
         }))
     }
+}
+
+fn reconcile_startup_orphans(
+    store: &SynapseStore,
+    module_generation: u64,
+    telemetry: &AdmissionTelemetry,
+) -> Result<usize, SynapseStoreError> {
+    let restart_error = WireOperationError::from_stable(
+        StableError::module_restarted(),
+        "module restarted before the durable job reached a terminal result",
+    );
+    let count = store.fail_prior_generation_incomplete_jobs(
+        module_generation,
+        &serde_json::to_value(&restart_error).expect("restart error serializes"),
+        now_ms(),
+    )?;
+    if count > 0 {
+        telemetry.record_jobs_inherited(count as u64);
+        telemetry.record_jobs_failed(count as u64);
+    }
+    Ok(count)
 }
 
 impl RuntimeState {
@@ -6298,6 +6350,8 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
                     true,
                     transient_model_load_error(format!("complete model.load job: {error}")),
                 );
+            } else {
+                state.runtime.admission_telemetry.record_job_completed();
             }
         }
         Err(error) => {
@@ -7543,6 +7597,7 @@ async fn execute_remote_embed_batch_job(
     });
     match state.store.finish_job(&job_id, &summary, now_ms()) {
         Ok(()) => {
+            state.runtime.admission_telemetry.record_job_completed();
             state
                 .runtime
                 .activity_telemetry
@@ -9775,13 +9830,16 @@ async fn execute_embed_batch_job(
             "module_generation": state.module_generation,
         });
         match state.store.finish_job(&job_id, &summary, now_ms()) {
-            Ok(()) => log_job_done(
-                &work.model.model_id,
-                &job_id,
-                execution_lane(&work.model),
-                requested_tokens,
-                started,
-            ),
+            Ok(()) => {
+                state.runtime.admission_telemetry.record_job_completed();
+                log_job_done(
+                    &work.model.model_id,
+                    &job_id,
+                    execution_lane(&work.model),
+                    requested_tokens,
+                    started,
+                );
+            }
             Err(error) => fail_job_with_wire_error(
                 &state,
                 &job_id,
@@ -9866,13 +9924,16 @@ async fn execute_embed_batch_job(
         }
     }
     match state.store.finish_job(&job_id, &summary, now_ms()) {
-        Ok(()) => log_job_done(
-            &work.model.model_id,
-            &job_id,
-            execution_lane(&work.model),
-            requested_tokens,
-            started,
-        ),
+        Ok(()) => {
+            state.runtime.admission_telemetry.record_job_completed();
+            log_job_done(
+                &work.model.model_id,
+                &job_id,
+                execution_lane(&work.model),
+                requested_tokens,
+                started,
+            );
+        }
         Err(error) => fail_job_with_wire_error(
             &state,
             &job_id,
@@ -9931,7 +9992,12 @@ async fn enforce_checkpoint_continuity(
     )
     .await
     {
-        Ok(allowed) => allowed,
+        Ok(allowed) => {
+            if !allowed {
+                state.runtime.admission_telemetry.record_job_failed();
+            }
+            allowed
+        }
         Err(error) => {
             fail_job_with_wire_error(
                 state,
@@ -10245,6 +10311,7 @@ fn fail_job_with_wire_error(
         &serde_json::to_value(error).expect("wire error serializes"),
         now_ms(),
     );
+    state.runtime.admission_telemetry.record_job_failed();
 }
 
 fn job_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
@@ -10305,6 +10372,12 @@ async fn job_resume(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
     };
     let now = now_ms();
+    let prior_generation = state
+        .store
+        .get_job(&params.job_id)
+        .ok()
+        .flatten()
+        .map(|record| record.module_generation);
     let resumed = match state.store.resume_paused_job(
         &params.job_id,
         state.module_generation,
@@ -10314,6 +10387,9 @@ async fn job_resume(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(resumed) => resumed,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
+    if resumed && prior_generation.is_some_and(|gen| gen < state.module_generation) {
+        state.runtime.admission_telemetry.record_job_inherited();
+    }
     let record = match state.store.get_job(&params.job_id) {
         Ok(Some(record)) => record,
         Ok(None) => return channel_error("invalid_request", "unknown or expired job_id"),
@@ -11717,6 +11793,8 @@ async fn execute_probe_job(
                 format!("complete probe job: {error}"),
             ),
         );
+    } else {
+        state.runtime.admission_telemetry.record_job_completed();
     }
 }
 
@@ -13968,7 +14046,8 @@ async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
 }
 
 /// Report admission capacity plus process-local `{ refusals: { reason: { count,
-/// last_at_ms } }, jobs_minted }` counters. Refusal keys use stable identifiers from
+/// last_at_ms } }, jobs_minted, jobs_completed, jobs_failed, jobs_inherited, jobs_open }`
+/// counters. Refusal keys use stable identifiers from
 /// the admission protocol so clients can rely on the same keys across releases.
 async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     let scheduler = match state.runtime.scheduler.lock() {
@@ -14044,6 +14123,10 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         "execution_wait_p95_ms": execution_wait_p95_ms,
         "refusals": telemetry.refusals,
         "jobs_minted": telemetry.jobs_minted,
+        "jobs_completed": telemetry.jobs_completed,
+        "jobs_failed": telemetry.jobs_failed,
+        "jobs_inherited": telemetry.jobs_inherited,
+        "jobs_open": telemetry.jobs_open,
         "lanes": lanes,
         "catalog_lanes": catalog_measurements.lanes.len(),
         "certified_lanes": catalog_measurements.certified_lanes,
@@ -17265,6 +17348,156 @@ mod tests {
             decode_row["certified"], false,
             "uncertified decode lane must report certified=false"
         );
+    }
+
+    #[tokio::test]
+    async fn admission_telemetry_tracks_in_process_job_completion() {
+        let (root, descriptor) = test_storage_descriptor("telemetry-job-complete");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("telemetry-complete-os");
+        store.observe_profile(&profile, 10, 1).unwrap();
+        let state = test_module_state(store, profile);
+
+        let outcome = probe_start(
+            Arc::clone(&state),
+            json!({"request_key": "probe-complete-1"}),
+        )
+        .await;
+        let result = response_result(outcome, "probe.start");
+        let job_id = result["job_id"].as_str().expect("job_id in result");
+
+        let mut done = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let status_outcome = probe_status(Arc::clone(&state), json!({"job_id": job_id})).await;
+            let status_result = response_result(status_outcome, "probe.status");
+            if status_result["state"] == "done" {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "probe job did not finish in time");
+
+        let status_outcome = admission_status(Arc::clone(&state)).await;
+        let status = response_result(status_outcome, "admission.status");
+        assert_eq!(status["jobs_open"], 0, "jobs_open == 1");
+        assert_eq!(status["jobs_completed"], 1);
+        assert_eq!(status["jobs_minted"], 1);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn admission_telemetry_tracks_in_process_job_failure() {
+        let (root, descriptor) = test_storage_descriptor("telemetry-job-fail");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("telemetry-fail-os");
+        store.observe_profile(&profile, 10, 1).unwrap();
+        let state = test_module_state(store, profile);
+
+        let outcome = model_load(
+            Arc::clone(&state),
+            json!({
+                "request_key": "load-fail-1",
+                "model_id": "nonexistent-model",
+                "source": "file",
+                "path": "/tmp/nonexistent-model-dir-12345",
+                "files": {
+                    "model": {
+                        "url": "model.safetensors",
+                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                    },
+                    "tokenizer": {
+                        "url": "tokenizer.json",
+                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                    }
+                },
+                "engine": "ort"
+            }),
+        )
+        .await;
+        let result = response_result(outcome, "model.load");
+        let job_id = result["job_id"].as_str().expect("job_id in result");
+
+        let mut failed = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if let Ok(Some(record)) = state.store.get_job(job_id) {
+                if record.state == "failed_transient" || record.state == "failed_permanent" {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            let record = state.store.get_job(job_id).unwrap();
+            panic!("job state was: {record:?}");
+        }
+
+        let status_outcome = admission_status(Arc::clone(&state)).await;
+        let status = response_result(status_outcome, "admission.status");
+        assert_eq!(status["jobs_minted"], 1);
+        assert_eq!(status["jobs_failed"], 1);
+        assert_eq!(status["jobs_completed"], 0);
+        assert_eq!(status["jobs_open"], 0);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn admission_telemetry_tracks_startup_reconciliation_of_orphaned_jobs() {
+        let (root, descriptor) = test_storage_descriptor("telemetry-orphans");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("telemetry-orphans-os");
+        store.observe_profile(&profile, 10, 1).unwrap();
+
+        // Seed store with a job in running state from a prior process (generation 1)
+        let admission = store
+            .admit_job(
+                "orphan-key-1",
+                "orphan-digest-1",
+                "embed.batch",
+                1,
+                None,
+                &json!({"model": "test"}),
+                1000,
+                10_000,
+                10_000,
+            )
+            .unwrap();
+        let job_id = admission.record().job_id.clone();
+        assert!(store.mark_job_running(&job_id, 1, 1001).unwrap());
+
+        // New process startup reconciliation with generation 2
+        let telemetry = AdmissionTelemetry::default();
+        let reconciled =
+            reconcile_startup_orphans(&store, 2, &telemetry).expect("reconcile succeeds");
+        assert_eq!(reconciled, 1);
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.jobs_inherited, 1);
+        assert_eq!(snapshot.jobs_failed, 1);
+        assert_eq!(snapshot.jobs_minted, 0);
+        assert_eq!(snapshot.jobs_completed, 0);
+        assert_eq!(snapshot.jobs_open, 0);
+
+        let record = store.get_job(&job_id).unwrap().expect("job exists");
+        assert_eq!(record.state, JOB_STATE_FAILED_TRANSIENT);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admission_telemetry_jobs_open_never_underflows() {
+        let telemetry = AdmissionTelemetry::default();
+        telemetry.record_job_completed();
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.jobs_minted, 0);
+        assert_eq!(snapshot.jobs_completed, 1);
+        assert_eq!(snapshot.jobs_open, 0);
     }
 }
 

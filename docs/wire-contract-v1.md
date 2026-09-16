@@ -180,12 +180,22 @@ reported Neural Engine share across its buckets.
   write-commit when your index holds mixed provenance. Revocation is never
   retroactive: vectors written under a certified fingerprint stay readable;
   demotion affects the future only.
-- **admission.status** — advisory snapshot: queue depths, current knob, and
-  catalog-wide certification/performance health. Top-level `catalog_lanes`
-  counts every known lane, while `certified_lanes` counts lanes with
-  certification evidence for the current machine profile. Top-level
-  `certification_stale` and `performance_stale` scan the full catalog, including
-  unloaded lanes. The `lanes` array remains resident-only because its
+- **admission.status** — advisory snapshot: queue depths, current knob,
+  catalog-wide certification/performance health, and job outcome counters.
+  Job counters are per-process since start:
+  - `jobs_minted`: jobs admitted in this process;
+  - `jobs_completed`: minted jobs that reached a successful terminal state;
+  - `jobs_failed`: minted jobs that reached a failed terminal state;
+  - `jobs_inherited`: jobs reaching a terminal state in this process that were
+    admitted by a previous process (startup reconciliation of orphaned jobs or
+    resumed jobs);
+  - `jobs_open`: derived in-flight count satisfying the identity
+    `jobs_open = jobs_minted + jobs_inherited - jobs_completed - jobs_failed`
+    (saturating to zero, never underflowing).
+  Top-level `catalog_lanes` counts every known lane, while `certified_lanes`
+  counts lanes with certification evidence for the current machine profile.
+  Top-level `certification_stale` and `performance_stale` scan the full catalog,
+  including unloaded lanes. The `lanes` array remains resident-only because its
   `meeting_deadlines`, rolling start-delay, waiter, and in-flight values describe
   live execution state. The contract lives in per-request budgets, not this
   snapshot.
