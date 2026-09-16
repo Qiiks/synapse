@@ -123,6 +123,9 @@ pub(crate) struct Qwen3Model {
     pub(crate) embeddings: Tensor,
     pub(crate) layers: Vec<Qwen3Layer>,
     pub(crate) final_norm: Vec<f32>,
+    /// Set once the CUDA context has the layer weights; the host copies are
+    /// then dropped so only the VRAM residency survives.
+    weights_uploaded: bool,
 }
 
 pub(crate) fn resolve_model_root(path: &Path) -> Result<PathBuf> {
@@ -174,7 +177,14 @@ fn load_safetensor_map(root: &Path, original: &Path) -> Result<HashMap<String, T
 }
 
 fn load_safetensors_file(path: &Path) -> Result<HashMap<String, Tensor>> {
-    let bytes = fs::read(path).with_context(|| format!("read safetensors {}", path.display()))?;
+    // Map instead of reading: the file is large and every tensor is copied out
+    // into its own buffer below, so the whole-file `Vec<u8>` would only ever be
+    // a transient second copy of the model in host RAM.
+    let file = fs::File::open(path).with_context(|| format!("open safetensors {}", path.display()))?;
+    // SAFETY: the file is opened read-only and is not mutated or truncated while
+    // the mapping is alive (it is dropped at the end of this function).
+    let bytes = unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("mmap safetensors {}", path.display()))?;
     let tensors = SafeTensors::deserialize(&bytes)
         .map_err(|error| anyhow::anyhow!("load safetensors {}: {error}", path.display()))?;
     let mut result = HashMap::new();
@@ -631,35 +641,44 @@ impl Qwen3Model {
             eos_token_id: config
                 .eos_token_id
                 .context("Qwen3 config is missing eos_token_id")?,
+            weights_uploaded: false,
             embeddings,
             layers,
             final_norm,
         })
     }
 
+    /// Takes `&mut self` because the first successful forward transfers the
+    /// layer weights and the embedding table to the CUDA context and then
+    /// drops the host copies. Every later call reuses the VRAM residency.
     pub(crate) fn embed(
-        &self,
+        &mut self,
         context: &mut Qwen3Context,
         sequences: &[Vec<u32>],
     ) -> Result<Vec<Vec<f32>>> {
         let real_batch = sequences.len();
         ensure!(real_batch > 0 && sequences.iter().all(|ids| !ids.is_empty()));
         let seq = sequences.iter().map(Vec::len).max().unwrap_or(1);
-        let mut hidden = vec![0.0; real_batch * seq * self.hidden];
+        let mut token_ids = vec![0u32; real_batch * seq];
         let mut mask = vec![0u8; real_batch * seq];
         for (row, ids) in sequences.iter().enumerate() {
             for (position, &token) in ids.iter().enumerate() {
-                let token = token as usize;
-                ensure!(token < self.vocab_size);
-                let destination = (row * seq + position) * self.hidden;
-                hidden[destination..destination + self.hidden].copy_from_slice(
-                    &self.embeddings.data[token * self.hidden..(token + 1) * self.hidden],
-                );
+                ensure!((token as usize) < self.vocab_size);
+                token_ids[row * seq + position] = token;
                 mask[row * seq + position] = 1;
             }
         }
+        let mut hidden = vec![0.0f32; real_batch * seq * self.hidden];
+        let upload = !self.weights_uploaded;
+        // The CUDA worker wants the table as f16; encode once here so the
+        // upload path is a plain memcpy and the f32 table can be freed.
+        let embeddings_f16 = if upload {
+            Some(encode_f16_bits(&self.embeddings.data))
+        } else {
+            None
+        };
         context.forward(
-            &mut hidden,
+            &token_ids,
             &mask,
             real_batch,
             seq,
@@ -670,9 +689,24 @@ impl Qwen3Model {
             self.intermediate,
             self.epsilon,
             self.rope_theta,
-            &self.layers,
-            &self.final_norm,
+            upload.then_some(self.layers.as_slice()),
+            upload.then_some(self.final_norm.as_slice()),
+            embeddings_f16.as_deref(),
+            self.vocab_size,
+            &mut hidden,
         )?;
+        if upload {
+            // CUDA now owns every weight; release the ~2.2 GB of host f32.
+            self.layers = Vec::new();
+            self.layers.shrink_to_fit();
+            self.embeddings = Tensor {
+                shape: Vec::new(),
+                data: Vec::new(),
+            };
+            self.final_norm = Vec::new();
+            self.final_norm.shrink_to_fit();
+            self.weights_uploaded = true;
+        }
         let mut vectors = Vec::with_capacity(real_batch);
         for row in 0..real_batch {
             let last = (0..seq)
