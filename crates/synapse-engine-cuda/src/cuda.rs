@@ -290,6 +290,9 @@ mod enabled {
     pub struct Qwen3Context {
         binding: DeviceBinding,
         raw: NonNull<c_void>,
+        /// Layer count from the first (upload) forward; later forwards pass no
+        /// weight pointers, so the count must be remembered for the shape key.
+        layer_count: usize,
     }
 
     impl Qwen3Context {
@@ -303,6 +306,7 @@ mod enabled {
             Ok(Self {
                 binding,
                 raw: NonNull::new(raw).ok_or_else(last_error)?,
+                layer_count: 0,
             })
         }
 
@@ -357,6 +361,13 @@ mod enabled {
                 }
                 None => Vec::new(),
             };
+            if !params.is_empty() {
+                self.layer_count = params.len();
+            }
+            ensure!(
+                self.layer_count > 0,
+                "Qwen3 CUDA forward requires layer weights to be uploaded on the first call"
+            );
             let layers_ptr = if params.is_empty() {
                 std::ptr::null()
             } else {
@@ -374,7 +385,7 @@ mod enabled {
                     kv_heads as u64,
                     head_dim as u64,
                     intermediate as u64,
-                    params.len() as u64,
+                    self.layer_count as u64,
                     epsilon,
                     rope_theta,
                     token_ids.as_ptr(),
