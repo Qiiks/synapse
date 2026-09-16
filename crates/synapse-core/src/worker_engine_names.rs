@@ -16,3 +16,17 @@ pub const ANE_WORKER_ENGINE: &str = "ane-coreml-worker";
 pub const DECODE_WORKER_ENGINE: &str = "owned-metal-decode";
 /// The HELLO identity announced by the owned CUDA worker.
 pub const CUDA_WORKER_ENGINE: &str = "owned-cuda";
+
+/// Worker binary file names for sibling resolution beside the module binary.
+/// Release installers unpack each binary at the archive root, so a worker
+/// shipped in the same install directory is a sibling of `ck-synapse`.
+pub fn worker_binary_file_name(engine: &str) -> Option<&'static str> {
+    match engine {
+        LLAMA_ENGINE => Some("ck-synapse-worker-llama"),
+        "mlx" => Some("ck-synapse-worker-mlx"),
+        "ane" => Some("ck-synapse-worker-ane"),
+        "owned-cuda" => Some("ck-synapse-worker-cuda"),
+        "owned-metal-decode" => Some("ck-synapse-worker-decode"),
+        _ => None,
+    }
+}

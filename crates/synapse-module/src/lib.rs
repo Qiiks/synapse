@@ -98,6 +98,7 @@ use subc_protocol::{
 };
 use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
+    worker_binary_file_name,
     worker_engine_names::{
         ANE_WORKER_ENGINE, DECODE_WORKER_ENGINE, LLAMA_ENGINE, LLAMA_WORKER_ENGINE,
         MLX_WORKER_ENGINE,
@@ -5562,6 +5563,21 @@ fn ingest_owned_decode_q8(
     }
 }
 
+/// Resolve a supervised worker binary when the spec and the engine-specific
+/// env var are both absent: look for the worker shipped beside the running
+/// module binary (release archives unpack every binary at the archive root).
+/// Returns `None` when no sibling exists, so the existing refusal path keeps
+/// its message.
+fn resolve_worker_binary_sibling(engine: &str) -> Option<PathBuf> {
+    let file_name = worker_binary_file_name(engine)?;
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let mut candidate = dir.join(file_name);
+    #[cfg(windows)]
+    candidate.set_extension("exe");
+    candidate.is_file().then_some(candidate)
+}
+
 fn load_worker_backend_blocking(
     spec: &StoredModelConfig,
     artifact: &ValidatedArtifact,
@@ -5584,9 +5600,10 @@ fn load_worker_backend_blocking(
         .worker_bin
         .clone()
         .or_else(|| env::var_os(&worker_bin_var).map(PathBuf::from))
+        .or_else(|| resolve_worker_binary_sibling(&spec.engine))
         .ok_or_else(|| {
             artifact_invalid_error(format!(
-                "{} model '{}' requires worker_bin or {}",
+                "{} model '{}' requires worker_bin, {}, or a sibling worker binary",
                 spec.engine, spec.model_id, worker_bin_var
             ))
         })?;
@@ -15945,6 +15962,27 @@ mod tests {
             zero_start.elapsed()
         );
         drop(held);
+    }
+
+    #[test]
+    fn worker_binary_sibling_names_cover_every_worker_engine() {
+        // Release archives unpack every binary at the archive root, so these
+        // names are the sibling-resolution contract between the module and
+        // the worker binaries it spawns.
+        assert_eq!(
+            worker_binary_file_name("llama"),
+            Some("ck-synapse-worker-llama")
+        );
+        assert_eq!(
+            worker_binary_file_name("owned-cuda"),
+            Some("ck-synapse-worker-cuda")
+        );
+        assert_eq!(
+            worker_binary_file_name("owned-metal-decode"),
+            Some("ck-synapse-worker-decode")
+        );
+        assert_eq!(worker_binary_file_name("ort"), None);
+        assert_eq!(worker_binary_file_name("unknown-engine"), None);
     }
 
     #[test]
