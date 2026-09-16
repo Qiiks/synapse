@@ -5572,9 +5572,9 @@ fn resolve_worker_binary_sibling(engine: &str) -> Option<PathBuf> {
     let file_name = worker_binary_file_name(engine)?;
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let mut candidate = dir.join(file_name);
+    let candidate = dir.join(file_name);
     #[cfg(windows)]
-    candidate.set_extension("exe");
+    let candidate = candidate.with_extension("exe");
     candidate.is_file().then_some(candidate)
 }
 
