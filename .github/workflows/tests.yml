@@ -205,7 +205,23 @@ jobs:
 
       - name: fmt
         working-directory: synapse
-        run: cargo fmt --all --check
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          members=$(jq -r '.workspace_members as $members | .packages[] | select(.id as $id | $members | index($id)) | .name' <<< "$metadata")
+          packages=()
+          while IFS= read -r member; do
+            if [[ -n "$member" ]]; then
+              packages+=(-p "$member")
+            fi
+          done <<< "$members"
+          if (( ${#packages[@]} == 0 )); then
+            echo "error: cargo metadata returned an empty workspace member list; refusing vacuous fmt check" >&2
+            exit 1
+          fi
+          echo "Formatting $((${#packages[@]} / 2)) workspace members"
+          cargo fmt --check "${packages[@]}"
 
       - name: clippy
         working-directory: synapse
