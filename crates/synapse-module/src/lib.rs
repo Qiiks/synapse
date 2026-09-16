@@ -13025,7 +13025,23 @@ fn probe_fixtures() -> Result<Vec<ProbeFixture>, WireOperationError> {
             format!("decode built-in GTE ModernBERT probe fixture: {error}"),
         )
     })?;
-    Ok(vec![minilm, gte])
+
+    // Qwen3-Embedding reference vectors for the owned-cuda and owned-metal
+    // Qwen3 lanes: candle-transformers CPU f32, last-token pool/L2, generated
+    // independently of the kernels under test. Without this set, owned-cuda
+    // Qwen3 certification dead-ends at `reference_fixture_missing`.
+    let mut qwen3: ProbeFixture = serde_json::from_str(include_str!(
+        "fixtures/probe_corpus_qwen3_embedding_fp32.json"
+    ))
+    .map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::artifact_invalid(),
+            format!("decode built-in Qwen3 embedding probe fixture: {error}"),
+        )
+    })?;
+    qwen3.dims = fixture_reference_dims(&qwen3);
+
+    Ok(vec![minilm, gte, qwen3])
 }
 
 fn probe_reference_key(model: &EmbeddingModel) -> ProbeReferenceKey {
@@ -13040,6 +13056,8 @@ fn probe_reference_key(model: &EmbeddingModel) -> ProbeReferenceKey {
                 Some("gte-modernbert".to_string())
             } else if model_id.contains("minilm") {
                 Some("minilm".to_string())
+            } else if model_id.contains("qwen3-embedding") {
+                Some("qwen3-0.6b".to_string())
             } else {
                 None
             }
@@ -13049,6 +13067,8 @@ fn probe_reference_key(model: &EmbeddingModel) -> ProbeReferenceKey {
         "gte-modernbert-base".to_string()
     } else if model_id.contains("minilm") {
         "minilm".to_string()
+    } else if model_id.contains("qwen3-embedding") {
+        "qwen3-embedding-0.6b".to_string()
     } else {
         model.model_id.clone()
     };
@@ -15925,6 +15945,47 @@ mod tests {
             zero_start.elapsed()
         );
         drop(held);
+    }
+
+    #[test]
+    fn embed_probe_fixtures_cover_every_owned_family_with_reference_identity() {
+        let fixtures = probe_fixtures().expect("shipped embed fixtures should parse");
+        assert_eq!(fixtures.len(), 3);
+        let identities = fixtures
+            .iter()
+            .map(|fixture| {
+                (
+                    fixture.family.clone().unwrap_or_default(),
+                    fixture.reference_model.clone().unwrap_or_default(),
+                    fixture_reference_dims(fixture),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            identities,
+            BTreeSet::from([
+                ("minilm".to_string(), "minilm".to_string(), Some(384)),
+                (
+                    "gte-modernbert".to_string(),
+                    "gte-modernbert-base".to_string(),
+                    Some(768)
+                ),
+                (
+                    "qwen3-0.6b".to_string(),
+                    "qwen3-embedding-0.6b".to_string(),
+                    Some(1024)
+                ),
+            ])
+        );
+        // The owned-CUDA Qwen3 identity resolves to the Qwen3 fixture set; a
+        // missing set here is exactly the `reference_fixture_missing`
+        // certification dead-end this fixture closes.
+        let qwen3 = fixtures
+            .iter()
+            .find(|fixture| fixture.family.as_deref() == Some("qwen3-0.6b"))
+            .expect("qwen3 fixture present");
+        assert_eq!(qwen3.items.len(), 64);
+        assert!(qwen3.items.iter().all(|item| item.vector.len() == 1024));
     }
 
     #[test]
