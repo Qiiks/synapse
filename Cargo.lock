@@ -6784,6 +6784,7 @@ dependencies = [
  "anyhow",
  "cc",
  "half",
+ "memmap2",
  "safetensors 0.6.2",
  "serde",
  "serde_json",

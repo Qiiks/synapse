@@ -540,9 +540,14 @@ pub fn detect_family(model_path: impl AsRef<Path>) -> Result<ModelFamily, CudaEn
 
 fn verify_digest(path: &Path, expected: &str) -> Result<(), EngineError> {
     let expected = expected.strip_prefix("sha256:").unwrap_or(expected);
-    let bytes = std::fs::read(path)
+    // Hash the file through a streaming reader: reading it whole would hold a
+    // second full copy of the model in host RAM for the duration of the hash.
+    let mut file = std::fs::File::open(path)
         .map_err(|error| OwnedCudaEmbedEngine::error(EngineErrorStage::Load, error.to_string()))?;
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|error| OwnedCudaEmbedEngine::error(EngineErrorStage::Load, error.to_string()))?;
+    let actual = format!("{:x}", hasher.finalize());
     if actual == expected {
         Ok(())
     } else {

@@ -194,6 +194,20 @@ __global__ void to_float(const half *input, float *output, int count) {
     if (index < count) output[index] = __half2float(input[index]);
 }
 
+// Copies one embedding row per padded sequence position out of the device
+// table. Masked positions still read their token id (which the caller
+// zero-pads) but never contribute to attention because causal_softmax treats
+// them as -10000.
+__global__ void embed_gather(const uint32_t *token_ids, const half *table, half *output, int rows, int width) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const half *source = table + static_cast<size_t>(token_ids[row]) * width;
+    half *target = output + static_cast<size_t>(row) * width;
+    for (int column = threadIdx.x; column < width; column += blockDim.x) {
+        target[column] = source[column];
+    }
+}
+
 struct QwenContext;
 
 struct ShapePlan {
@@ -203,6 +217,7 @@ struct ShapePlan {
     size_t arena_bytes = 0;
     DeviceAllocation<unsigned char> arena, workspace;
     DeviceAllocation<uint8_t> mask;
+    DeviceAllocation<uint32_t> token_ids;
     DeviceAllocation<float> cosine, sine, output;
     half *x0 = nullptr, *x1 = nullptr, *normed = nullptr;
     half *q_raw = nullptr, *k_raw = nullptr, *v_raw = nullptr;
@@ -216,8 +231,8 @@ struct ShapePlan {
     ShapePlan(QwenContext *owner, int b, int s, int h, int qh_count, int kvh, int hd, int inter, int layers, float eps, float theta);
     ~ShapePlan();
     void compute(StageProfile *profile = nullptr);
-    void initialize_and_verify(const uint16_t *input, const uint8_t *host_mask);
-    void run(const uint16_t *input, const uint8_t *host_mask, float *host_output);
+    void initialize_and_verify(const uint32_t *host_ids, const uint8_t *host_mask);
+    void run(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output);
 };
 
 struct QwenContext {
@@ -228,6 +243,8 @@ struct QwenContext {
     int hidden = 0, query_heads = 0, kv_heads = 0, head_dim = 0, intermediate = 0, layer_count = 0;
     std::vector<DeviceLayer> layers;
     DeviceAllocation<float> final_norm;
+    DeviceAllocation<half> embeddings;
+    bool embeddings_loaded = false;
     std::unordered_map<std::string, std::unique_ptr<ShapePlan>> plans;
 
     explicit QwenContext(bool graphs) : graphs_enabled(graphs) {
@@ -246,6 +263,7 @@ struct QwenContext {
             if (hidden != h || query_heads != qh_count || kv_heads != kvh || head_dim != hd || intermediate != inter || layer_count != count) throw std::runtime_error("Qwen3 CUDA model dimensions changed");
             return;
         }
+        if (!params || !host_final_norm) throw std::runtime_error("Qwen3 CUDA load_weights received null layer pointers");
         hidden = h; query_heads = qh_count; kv_heads = kvh; head_dim = hd; intermediate = inter; layer_count = count;
         int q_width = qh_count * hd;
         int kv_width = kvh * hd;
@@ -270,6 +288,18 @@ struct QwenContext {
         weights_loaded = true;
         std::fprintf(stderr, "CUDA Qwen3 persistent weights: layers=%d dtype=f16 accum=fp32 norm_params=fp32\n", count);
     }
+
+    void load_embeddings(const uint16_t *host_embeddings, int vocab, int width) {
+        if (embeddings_loaded) {
+            if (vocab != static_cast<int>(embeddings.count / static_cast<size_t>(width)) || width != hidden) throw std::runtime_error("Qwen3 CUDA embedding table dimensions changed");
+            return;
+        }
+        size_t total = static_cast<size_t>(vocab) * width;
+        embeddings.allocate(total);
+        FAMILY_CUDA_CHECK(cudaMemcpy(embeddings.pointer, host_embeddings, total * sizeof(half), cudaMemcpyHostToDevice));
+        embeddings_loaded = true;
+        std::fprintf(stderr, "CUDA Qwen3 persistent embeddings: vocab=%d hidden=%d bytes=%zu\n", vocab, width, total * sizeof(half));
+    }
 };
 
 ShapePlan::ShapePlan(QwenContext *owner, int b, int s, int h, int qh_count, int kvh, int hd, int inter, int layers_count, float eps, float theta)
@@ -284,6 +314,7 @@ ShapePlan::ShapePlan(QwenContext *owner, int b, int s, int h, int qh_count, int 
     arena_bytes = total * sizeof(half) + 20 * 256;
     arena.allocate(arena_bytes);
     mask.allocate(rows);
+    token_ids.allocate(rows);
     output.allocate(hidden_values);
     unsigned char *cursor = arena.pointer;
     auto take = [&](size_t count) {
@@ -343,6 +374,9 @@ void ShapePlan::compute(StageProfile *profile) {
     size_t score_group_values = static_cast<size_t>(batch) * kv_heads * seq * seq;
     auto begin = [&](const char *name) { if (profile) profile->begin(name, context->stream); };
     auto end = [&] { if (profile) profile->end(context->stream); };
+    begin("pointwise_layout");
+    embed_gather<<<rows, threads, 0, context->stream>>>(token_ids.pointer, context->embeddings.pointer, x0, rows, hidden);
+    end();
     for (int index = 0; index < layer_count; ++index) {
         DeviceLayer &layer = context->layers[index];
         begin("pointwise_layout");
@@ -402,10 +436,10 @@ void ShapePlan::compute(StageProfile *profile) {
     FAMILY_CUDA_CHECK(cudaGetLastError());
 }
 
-void ShapePlan::initialize_and_verify(const uint16_t *input, const uint8_t *host_mask) {
-    size_t input_bytes = static_cast<size_t>(batch) * seq * hidden * sizeof(half);
+void ShapePlan::initialize_and_verify(const uint32_t *host_ids, const uint8_t *host_mask) {
+    size_t ids_bytes = static_cast<size_t>(batch) * seq * sizeof(uint32_t);
     size_t mask_bytes = static_cast<size_t>(batch) * seq;
-    FAMILY_CUDA_CHECK(cudaMemcpyAsync(x0, input, input_bytes, cudaMemcpyHostToDevice, context->stream));
+    FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
     StageProfile profile;
     compute(&profile);
@@ -417,7 +451,7 @@ void ShapePlan::initialize_and_verify(const uint16_t *input, const uint8_t *host
     compute();
     FAMILY_CUDA_CHECK(cudaStreamEndCapture(context->stream, &graph));
     FAMILY_CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
-    FAMILY_CUDA_CHECK(cudaMemcpyAsync(x0, input, input_bytes, cudaMemcpyHostToDevice, context->stream));
+    FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
     FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
@@ -427,10 +461,10 @@ void ShapePlan::initialize_and_verify(const uint16_t *input, const uint8_t *host
     std::fprintf(stderr, "CUDA Qwen3 shape %dx%d: arena=%zu workspace=%zu captured_exact=true launches=%d gqa=two-group-strided kv_repeat_bytes=0 stage_projection_mlp_gemm=%.3fms stage_attention_gemm=%.3fms stage_score_softmax=%.3fms stage_pointwise_layout=%.3fms stage_final_norm_output=%.3fms\n", batch, seq, arena_bytes, workspace.count, layer_count * (15 + 2 * (query_heads / kv_heads)) + 2, stage_ms["projection_mlp_gemm"], stage_ms["attention_gemm"], stage_ms["score_softmax"], stage_ms["pointwise_layout"], stage_ms["final_norm_output"]);
 }
 
-void ShapePlan::run(const uint16_t *input, const uint8_t *host_mask, float *host_output) {
-    size_t input_bytes = static_cast<size_t>(batch) * seq * hidden * sizeof(half);
+void ShapePlan::run(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output) {
+    size_t ids_bytes = static_cast<size_t>(batch) * seq * sizeof(uint32_t);
     size_t mask_bytes = static_cast<size_t>(batch) * seq;
-    FAMILY_CUDA_CHECK(cudaMemcpyAsync(x0, input, input_bytes, cudaMemcpyHostToDevice, context->stream));
+    FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
     if (context->graphs_enabled) FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
     else compute();
@@ -467,25 +501,33 @@ int32_t synapse_cuda_qwen3_forward(
     uint64_t layer_count,
     float epsilon,
     float rope_theta,
-    const uint16_t *input,
+    const uint32_t *token_ids,
     const uint8_t *attention_mask,
     const Qwen3LayerParams *layers,
     const float *final_norm,
+    const uint16_t *embeddings,
+    uint64_t vocab_size,
+    int32_t upload_weights,
+    int32_t upload_embeddings,
     float *output
 ) {
     try {
-        if (!raw_context || !input || !attention_mask || !layers || !final_norm || !output) throw std::runtime_error("Qwen3 CUDA received a null pointer");
+        if (!raw_context || !token_ids || !attention_mask || !output) throw std::runtime_error("Qwen3 CUDA received a null pointer");
+        if (upload_weights && (!layers || !final_norm)) throw std::runtime_error("Qwen3 CUDA weight upload requires layer and final-norm pointers");
+        if (upload_embeddings && !embeddings) throw std::runtime_error("Qwen3 CUDA embedding upload requires a host table pointer");
         if (!batch || !seq || !hidden || !query_heads || !kv_heads || query_heads % kv_heads || !head_dim || !layer_count) throw std::runtime_error("Qwen3 CUDA received invalid dimensions");
         QwenContext *context = static_cast<QwenContext *>(raw_context);
-        context->load_weights(hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, layers, final_norm);
+        if (upload_weights) context->load_weights(hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, layers, final_norm);
+        if (upload_embeddings) context->load_embeddings(embeddings, static_cast<int>(vocab_size), static_cast<int>(hidden));
+        if (!context->weights_loaded || !context->embeddings_loaded) throw std::runtime_error("Qwen3 CUDA forward called before weights and embeddings were uploaded");
         std::string key = shape_key(batch, seq);
         auto found = context->plans.find(key);
         if (found == context->plans.end()) {
             auto plan = std::make_unique<ShapePlan>(context, batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon, rope_theta);
-            plan->initialize_and_verify(input, attention_mask);
+            plan->initialize_and_verify(token_ids, attention_mask);
             found = context->plans.emplace(key, std::move(plan)).first;
         }
-        found->second->run(input, attention_mask, output);
+        found->second->run(token_ids, attention_mask, output);
         return 0;
     } catch (const std::exception &error) {
         synapse_cuda_set_last_error(error.what());

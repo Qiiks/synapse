@@ -290,6 +290,9 @@ mod enabled {
     pub struct Qwen3Context {
         binding: DeviceBinding,
         raw: NonNull<c_void>,
+        /// Layer count from the first (upload) forward; later forwards pass no
+        /// weight pointers, so the count must be remembered for the shape key.
+        layer_count: usize,
     }
 
     impl Qwen3Context {
@@ -303,12 +306,16 @@ mod enabled {
             Ok(Self {
                 binding,
                 raw: NonNull::new(raw).ok_or_else(last_error)?,
+                layer_count: 0,
             })
         }
 
+        /// First call uploads the layer weights and the embedding table, then
+        /// the caller drops its host copies. Every later call passes null
+        /// pointers for the upload payloads and the flags as 0.
         pub fn forward(
             &mut self,
-            hidden_states: &mut [f32],
+            token_ids: &[u32],
             attention_mask: &[u8],
             batch: usize,
             seq: usize,
@@ -319,30 +326,55 @@ mod enabled {
             intermediate: usize,
             epsilon: f32,
             rope_theta: f32,
-            layers: &[Qwen3Layer],
-            final_norm: &[f32],
+            layers: Option<&[Qwen3Layer]>,
+            final_norm: Option<&[f32]>,
+            embeddings: Option<&[u16]>,
+            vocab_size: usize,
+            output: &mut [f32],
         ) -> Result<()> {
             self.binding.bind()?;
-            ensure!(hidden_states.len() == batch * seq * hidden);
+            ensure!(token_ids.len() == batch * seq);
             ensure!(attention_mask.len() == batch * seq);
-            ensure!(final_norm.len() == hidden);
-            let params = layers
-                .iter()
-                .map(|layer| Qwen3LayerParams {
-                    input_norm: layer.input_norm.as_ptr(),
-                    post_attention_norm: layer.post_attention_norm.as_ptr(),
-                    q_weight: layer.q_weight.as_ptr(),
-                    q_norm: layer.q_norm.as_ptr(),
-                    k_weight: layer.k_weight.as_ptr(),
-                    k_norm: layer.k_norm.as_ptr(),
-                    v_weight: layer.v_weight.as_ptr(),
-                    o_weight: layer.o_weight.as_ptr(),
-                    gate_weight: layer.gate_weight.as_ptr(),
-                    up_weight: layer.up_weight.as_ptr(),
-                    down_weight: layer.down_weight.as_ptr(),
-                })
-                .collect::<Vec<_>>();
-            let input = crate::encode_f16_bits(hidden_states);
+            ensure!(output.len() == batch * seq * hidden);
+            let params = match layers {
+                Some(layers) => {
+                    ensure!(
+                        final_norm.is_some_and(|norm| norm.len() == hidden),
+                        "Qwen3 weight upload requires a final-norm vector of length {hidden}"
+                    );
+                    layers
+                        .iter()
+                        .map(|layer| Qwen3LayerParams {
+                            input_norm: layer.input_norm.as_ptr(),
+                            post_attention_norm: layer.post_attention_norm.as_ptr(),
+                            q_weight: layer.q_weight.as_ptr(),
+                            q_norm: layer.q_norm.as_ptr(),
+                            k_weight: layer.k_weight.as_ptr(),
+                            k_norm: layer.k_norm.as_ptr(),
+                            v_weight: layer.v_weight.as_ptr(),
+                            o_weight: layer.o_weight.as_ptr(),
+                            gate_weight: layer.gate_weight.as_ptr(),
+                            up_weight: layer.up_weight.as_ptr(),
+                            down_weight: layer.down_weight.as_ptr(),
+                        })
+                        .collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            };
+            if !params.is_empty() {
+                self.layer_count = params.len();
+            }
+            ensure!(
+                self.layer_count > 0,
+                "Qwen3 CUDA forward requires layer weights to be uploaded on the first call"
+            );
+            let layers_ptr = if params.is_empty() {
+                std::ptr::null()
+            } else {
+                params.as_ptr()
+            };
+            let final_norm_ptr = final_norm.map_or(std::ptr::null(), <[f32]>::as_ptr);
+            let embeddings_ptr = embeddings.map_or(std::ptr::null(), <[u16]>::as_ptr);
             let status = unsafe {
                 synapse_cuda_qwen3_forward(
                     self.raw.as_ptr(),
@@ -353,14 +385,18 @@ mod enabled {
                     kv_heads as u64,
                     head_dim as u64,
                     intermediate as u64,
-                    params.len() as u64,
+                    self.layer_count as u64,
                     epsilon,
                     rope_theta,
-                    input.as_ptr(),
+                    token_ids.as_ptr(),
                     attention_mask.as_ptr(),
-                    params.as_ptr(),
-                    final_norm.as_ptr(),
-                    hidden_states.as_mut_ptr(),
+                    layers_ptr,
+                    final_norm_ptr,
+                    embeddings_ptr,
+                    vocab_size as u64,
+                    i32::from(!params.is_empty()),
+                    i32::from(embeddings.is_some()),
+                    output.as_mut_ptr(),
                 )
             };
             check_status(status, "CUDA Qwen3 encoder")
@@ -489,10 +525,14 @@ mod enabled {
             layer_count: u64,
             epsilon: f32,
             rope_theta: f32,
-            input: *const u16,
+            token_ids: *const u32,
             attention_mask: *const u8,
             layers: *const Qwen3LayerParams,
             final_norm: *const f32,
+            embeddings: *const u16,
+            vocab_size: u64,
+            upload_weights: i32,
+            upload_embeddings: i32,
             output: *mut f32,
         ) -> i32;
         fn synapse_cuda_last_error() -> *const c_char;
@@ -567,7 +607,7 @@ mod enabled {
         #[allow(clippy::too_many_arguments)]
         pub fn forward(
             &mut self,
-            _hidden_states: &mut [f32],
+            _token_ids: &[u32],
             _attention_mask: &[u8],
             _batch: usize,
             _seq: usize,
@@ -578,8 +618,11 @@ mod enabled {
             _intermediate: usize,
             _epsilon: f32,
             _rope_theta: f32,
-            _layers: &[Qwen3Layer],
-            _final_norm: &[f32],
+            _layers: Option<&[Qwen3Layer]>,
+            _final_norm: Option<&[f32]>,
+            _embeddings: Option<&[u16]>,
+            _vocab_size: usize,
+            _output: &mut [f32],
         ) -> Result<()> {
             bail!("owned CUDA is unavailable in this build")
         }
