@@ -124,3 +124,8 @@ The worker delays its cuBLASLt import and checks runtime library loading
 before CUDA calls. No global PATH changes or extra DLL search directories
 are needed. Release-matrix publication remains separate from this manual
 gate artifact.
+
+This delay-loading behavior is Windows-only. The Linux ELF worker retains a
+`DT_NEEDED` dependency on `libcublasLt.so.12`; without that runtime on the
+library search path, even `--probe-floor` exits 127 before reaching the
+driver-only probe.
