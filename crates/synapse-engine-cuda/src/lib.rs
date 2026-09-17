@@ -18,6 +18,8 @@ use synapse_core::{
 mod cuda;
 mod model;
 
+pub use cuda::probe_hardware_floor;
+
 pub const ENGINE_VERSION: &str = "owned-cuda-v1";
 /// The source revision from which the CUDA kernels were ported.
 pub const KERNEL_REVISION: &str = "4d0ded67c30286fe2be37cc7413359ad745dd751";
@@ -181,6 +183,17 @@ pub fn build_identity(family: ModelFamily, dtype: StorageDType) -> CudaBuildIden
         minimum_cuda_driver_api: MINIMUM_CUDA_DRIVER_API,
         risk_class: RISK_CLASS,
     }
+}
+
+/// A hardware-floor reading taken before any owned-CUDA worker is spawned.
+///
+/// Carried separately from [`device_meets_floor`] so the caller can log or
+/// refuse on the observed values rather than on a bare boolean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HardwareFloorProbe {
+    pub driver_api: u32,
+    pub compute_major: u32,
+    pub compute_minor: u32,
 }
 
 /// Hardware-floor predicate used by capability probes before worker creation.

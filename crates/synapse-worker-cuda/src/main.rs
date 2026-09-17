@@ -68,6 +68,27 @@ fn version_probe() -> bool {
     }
 }
 
+/// Print the observed hardware floor as a single JSON object and exit 0.
+///
+/// Only the CUDA-enabled build can answer; a build without the feature prints
+/// the error to stderr and exits non-zero so the caller records the refusal
+/// rather than mistaking silence for a pass.
+fn probe_floor() -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        let probe = synapse_engine_cuda::probe_hardware_floor()?;
+        println!(
+            "{{\"driver_api\":{},\"compute_capability\":{{\"major\":{},\"minor\":{}}}}}",
+            probe.driver_api, probe.compute_major, probe.compute_minor
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        anyhow::bail!("--probe-floor requires a build with cargo feature `cuda`")
+    }
+}
+
 /// Build the identity announced in the worker HELLO handshake.
 pub fn engine_identity() -> synapse_core::EngineIdentity {
     owned_cuda_engine_identity("worker", "f16", KERNEL_REVISION)
@@ -76,6 +97,9 @@ pub fn engine_identity() -> synapse_core::EngineIdentity {
 fn main() -> Result<()> {
     if version_probe() {
         return Ok(());
+    }
+    if std::env::args().skip(1).any(|arg| arg == "--probe-floor") {
+        return probe_floor();
     }
     let args = Args::parse();
     let hello = WorkerHello {
