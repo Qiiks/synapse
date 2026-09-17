@@ -17755,7 +17755,7 @@ mod tests {
             .expect("stage model blob");
         std::fs::write(
             model_cache.blob_path(&config_digest),
-            &std::fs::read(&config_src).expect("read config"),
+            std::fs::read(&config_src).expect("read config"),
         )
         .expect("stage config blob");
         let package = assemble_owned_model_package(
