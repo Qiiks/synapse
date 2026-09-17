@@ -100,3 +100,24 @@ Otherwise both readings come from the probe; partial overrides are not merged:
   0's compute capability as `major.minor`, for example `8.9`.
 - `SYNAPSE_CUDA_PACKAGING_DRIVER` — optional; the driver string a packaging
   build was tested against, carried into the refusal for diagnostics.
+
+### Windows owned-CUDA package
+
+The manual Windows CUDA gate packages the worker with runtime DLLs derived
+from the same pinned `cuda_cudart` and `libcublas` redistribution archives
+used for compilation. `scripts/package-owned-cuda.ps1` places the executable
+and DLLs at the ZIP root, includes component licenses, and records source
+components and SHA-256 hashes in `manifest.json`. The NVIDIA driver is not
+bundled and must already be installed.
+
+`scripts/test-owned-cuda-package.ps1 -Archive <zip> -RequireGpu` extracts a
+fresh copy, verifies hashes, and checks no-sidecar `--version`, actionable
+missing-library refusal, and a real hardware-floor probe with adjacent DLLs
+and CUDA removed from PATH. Without `-RequireGpu`, a runner without NVIDIA
+hardware may report an explicit driver/device refusal; this is not a GPU
+execution pass. Neither mode loads model weights or certifies embeddings.
+
+The worker delays its cuBLASLt import and checks runtime library loading
+before CUDA calls. No global PATH changes or extra DLL search directories
+are needed. Release-matrix publication remains separate from this manual
+gate artifact.

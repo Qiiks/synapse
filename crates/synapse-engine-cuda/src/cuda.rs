@@ -60,8 +60,46 @@ mod enabled {
         context: NonNull<c_void>,
     }
 
+    /// Keep successfully loaded libraries resident for all subsequent FFI calls.
+    /// Resolve explicitly before touching a delay import so failure is a Rust
+    /// error, not an unhandled Windows loader exception.
+    fn ensure_libraries_loaded() -> Result<()> {
+        #[cfg(target_env = "msvc")]
+        {
+            use std::sync::LazyLock;
+            static LOADED: LazyLock<Result<(), String>> = LazyLock::new(|| {
+                #[link(name = "kernel32")]
+                unsafe extern "system" {
+                    fn LoadLibraryW(name: *const u16) -> *mut c_void;
+                }
+                for name in [
+                    "cublasLt64_13.dll",
+                    "cublas64_13.dll",
+                    "cudart64_13.dll",
+                    "nvcuda.dll",
+                ] {
+                    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+                    // Windows searches the executable directory and installed
+                    // system locations without changing PATH or global policy.
+                    if unsafe { LoadLibraryW(wide.as_ptr()) }.is_null() {
+                        return Err(format!(
+                            "cannot load CUDA library {name}: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                }
+                Ok(())
+            });
+            if let Err(message) = &*LOADED {
+                anyhow::bail!("{message}");
+            }
+        }
+        Ok(())
+    }
+
     impl DeviceBinding {
         fn capture() -> Result<Self> {
+            ensure_libraries_loaded()?;
             cuda_driver_check(unsafe { cuInit(0) }, "cuInit")?;
             let mut runtime_device = 0;
             cuda_runtime_check(
@@ -110,6 +148,7 @@ mod enabled {
     }
 
     pub fn ensure_available() -> Result<()> {
+        ensure_libraries_loaded()?;
         cuda_driver_check(unsafe { cuInit(0) }, "cuInit")?;
         let version = unsafe { synapse_cuda_cublaslt_version() };
         ensure!(version > 0, "cuBLASLt did not report a version");
@@ -124,6 +163,7 @@ mod enabled {
     /// applied to, which is why it reports the raw numbers rather than a
     /// verdict.
     pub fn probe_hardware_floor() -> Result<crate::HardwareFloorProbe> {
+        ensure_libraries_loaded()?;
         cuda_driver_check(unsafe { cuInit(0) }, "cuInit")?;
         let mut driver_api = 0;
         cuda_driver_check(
