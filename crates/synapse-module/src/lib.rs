@@ -6247,13 +6247,34 @@ fn ensure_owned_cuda_floor(worker: Option<&Path>) -> Result<(), WireOperationErr
     ))
 }
 
-fn owned_cuda_evidence(state: &ModuleState, model: &EmbeddingModel) -> Option<Value> {
+async fn owned_cuda_evidence(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+) -> Result<Option<Value>, WireOperationError> {
     if model.engine_identity.engine != CUDA_WORKER_ENGINE {
-        return None;
+        return Ok(None);
     }
-    let decision = owned_cuda_floor_decision(None);
-    let observed = owned_cuda_floor_observed(&decision, None);
-    Some(json!({
+    let worker = state
+        .runtime
+        .catalog
+        .lock()
+        .ok()
+        .and_then(|catalog| {
+            catalog
+                .get(&model.model_id)
+                .map(|slot| slot.spec.worker_bin.clone())
+        })
+        .ok_or_else(|| {
+            artifact_invalid_error(format!("missing catalog entry for '{}'", model.model_id))
+        })?;
+    let (decision, observed) = tokio::task::spawn_blocking(move || {
+        let decision = owned_cuda_floor_decision(worker.as_deref());
+        let observed = owned_cuda_floor_observed(&decision, worker.as_deref());
+        (decision, observed)
+    })
+    .await
+    .map_err(|error| transient_model_load_error(format!("CUDA evidence task failed: {error}")))?;
+    Ok(Some(json!({
         "engine": CUDA_WORKER_ENGINE,
         "backend": model.engine_identity.build_flags.get("backend"),
         "ptx_virtual_arch": model.engine_identity.build_flags.get("ptx_virtual_arch").cloned().unwrap_or_else(|| OWNED_CUDA_PTX_VIRTUAL_ARCH.to_string()),
@@ -6269,7 +6290,7 @@ fn owned_cuda_evidence(state: &ModuleState, model: &EmbeddingModel) -> Option<Va
         "warm_load_ms": Value::Null,
         "device_memory": Value::Null,
         "resident_process_count": 1,
-    }))
+    })))
 }
 
 fn artifact_invalid_error(message: impl Into<String>) -> WireOperationError {
@@ -12159,11 +12180,12 @@ async fn execute_embed_probe_for_model(
         true
     };
     let passed = quality_passed && placement_passed;
+    let cuda_evidence = owned_cuda_evidence(state, &model).await?;
     let certification_evidence = json!({
         "task": "embed",
         "metrics": evidence,
         "ane_placement_share": placement_share,
-        "cuda": owned_cuda_evidence(state, &model),
+        "cuda": cuda_evidence,
     });
     let performance = if passed {
         let cold_load_ms =
@@ -12198,7 +12220,7 @@ async fn execute_embed_probe_for_model(
                 "worst_decile": state.runtime.probe.worst_decile_rank_overlap_threshold,
                 "ane_placement_share": state.runtime.probe.ane_placement_threshold,
             },
-            "cuda": owned_cuda_evidence(state, &model),
+            "cuda": cuda_evidence,
             "performance": performance,
         }),
         certified_vectors: passed.then_some(vectors),
@@ -17321,6 +17343,79 @@ mod tests {
         .expect("write test tokenizer");
         SanitizedTokenizer::from_file(&path, TokenizerConfig { max_tokens })
             .expect("load test tokenizer")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cuda_certification_evidence_uses_model_worker_without_blocking() {
+        let (storage_dir, descriptor) = test_storage_descriptor("cuda-evidence");
+        let store = Arc::new(SynapseStore::open(&descriptor).expect("open test store"));
+        let profile = test_machine_profile("test-os");
+        store
+            .activate_profile(&profile, 1, 1000)
+            .expect("activate profile");
+        let state = test_module_state(store, profile);
+        let worker = storage_dir.join(if cfg!(windows) {
+            "probe.cmd"
+        } else {
+            "probe.sh"
+        });
+        let output = r#"{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}"#;
+        let script = if cfg!(windows) {
+            format!("@echo off\r\nping -n 3 127.0.0.1 >nul\r\necho {output}\r\n")
+        } else {
+            format!("#!/bin/sh\nsleep 2\nprintf '%s\\n' '{output}'\n")
+        };
+        fs::write(&worker, script).expect("write probe");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut spec = stuck_model_spec();
+        spec.engine_identity.engine = CUDA_WORKER_ENGINE.to_string();
+        spec.worker_bin = Some(worker);
+        state
+            .runtime
+            .catalog
+            .lock()
+            .unwrap()
+            .get_mut(&spec.model_id)
+            .unwrap()
+            .spec = spec.clone();
+        // This test exercises evidence collection only; no engine inference occurs.
+        let mut engine = OwnedMetalEmbedEngine::new(OwnedFamily::MiniLm, OwnedDType::F16);
+        let loaded_model = engine.insert_test_model("evidence-test".to_string(), 384, vec![128]);
+        let model = EmbeddingModel {
+            model_id: spec.model_id,
+            task: ModelTask::Embed,
+            loaded_model,
+            backend: EmbedBackend::Owned(Arc::new(Mutex::new(engine))),
+            tokenizer: make_test_tokenizer(&storage_dir, 128),
+            numeric_profile_id: spec.numeric_profile_id,
+            fingerprint: spec.fingerprint.clone(),
+            certification_fingerprint: spec.fingerprint,
+            engine_identity: spec.engine_identity,
+            owned_tokenizer_policy: None,
+            owned_decode_resolution_refusal: None,
+        };
+        let evidence = owned_cuda_evidence(&state, &model);
+        tokio::pin!(evidence);
+        // A blocking probe on this single-thread executor would complete before
+        // the timer can run. The model-specific probe must instead remain pending.
+        tokio::select! {
+            biased;
+            result = &mut evidence => panic!("probe completed before executor progressed: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        let evidence = evidence
+            .await
+            .expect("evidence task")
+            .expect("CUDA evidence");
+        assert_eq!(evidence["floor_state"], "supported");
+        assert_eq!(evidence["observed"]["driver_api"], 13030);
+        // Windows keeps the tokenizer file mapped while the process runs, so
+        // scratch removal is best effort here; assertions above are the contract.
+        let _ = fs::remove_dir_all(storage_dir);
     }
 
     #[test]
