@@ -6035,20 +6035,30 @@ struct OwnedCudaFloorReading {
     compute_minor: u32,
 }
 
-static OWNED_CUDA_PROBE: OnceLock<Result<OwnedCudaFloorReading, String>> = OnceLock::new();
+static OWNED_CUDA_PROBE: std::sync::LazyLock<
+    Mutex<HashMap<PathBuf, Result<OwnedCudaFloorReading, String>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Cache one short-lived worker probe; a complete environment override skips it.
-fn owned_cuda_probe_floor(worker: Option<&Path>) -> &'static Result<OwnedCudaFloorReading, String> {
-    OWNED_CUDA_PROBE.get_or_init(|| {
-        let worker = worker
-            .map(Path::to_path_buf)
-            .or_else(|| env::var_os(worker_binary_env_var(CUDA_WORKER_ENGINE)).map(PathBuf::from))
-            .or_else(|| resolve_worker_binary_sibling(CUDA_WORKER_ENGINE))
-            .ok_or_else(|| "CUDA floor probe worker binary not found".to_string())?;
-        let mut command = std::process::Command::new(worker);
-        command.arg("--probe-floor");
-        run_owned_cuda_probe(&mut command, Duration::from_secs(10))
-    })
+/// Cache successes and failures per worker; a complete environment override skips it.
+fn owned_cuda_probe_floor(worker: Option<&Path>) -> Result<OwnedCudaFloorReading, String> {
+    let worker = worker
+        .map(Path::to_path_buf)
+        .or_else(|| env::var_os(worker_binary_env_var(CUDA_WORKER_ENGINE)).map(PathBuf::from))
+        .or_else(|| resolve_worker_binary_sibling(CUDA_WORKER_ENGINE))
+        .ok_or_else(|| "CUDA floor probe worker binary not found".to_string())?;
+    let worker = fs::canonicalize(&worker).unwrap_or(worker);
+    let mut cache = OWNED_CUDA_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Failed probes stay cached deliberately until module restart, for this worker only.
+    cache
+        .entry(worker)
+        .or_insert_with_key(|worker| {
+            let mut command = std::process::Command::new(worker);
+            command.arg("--probe-floor");
+            run_owned_cuda_probe(&mut command, Duration::from_secs(10))
+        })
+        .clone()
 }
 
 fn run_owned_cuda_probe(
@@ -6151,14 +6161,14 @@ fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
     parts.next().is_none().then_some((major, minor))
 }
 
-fn owned_cuda_floor_observed(decision: &CudaFloorDecision) -> Value {
-    floor_observed_with_probe_error(
-        decision,
-        OWNED_CUDA_PROBE
-            .get()
-            .and_then(|result| result.as_ref().err())
-            .map(String::as_str),
-    )
+fn owned_cuda_floor_observed(decision: &CudaFloorDecision, worker: Option<&Path>) -> Value {
+    let error = match decision {
+        CudaFloorDecision::Unsupported { observed: None, .. } => {
+            owned_cuda_probe_floor(worker).err()
+        }
+        _ => None,
+    };
+    floor_observed_with_probe_error(decision, error.as_deref())
 }
 
 fn floor_observed_with_probe_error(decision: &CudaFloorDecision, error: Option<&str>) -> Value {
@@ -6179,7 +6189,7 @@ fn ensure_owned_cuda_floor(worker: Option<&Path>) -> Result<(), WireOperationErr
     if decision.is_supported() {
         return Ok(());
     }
-    let observed = owned_cuda_floor_observed(&decision);
+    let observed = owned_cuda_floor_observed(&decision, worker);
     Err(WireOperationError::from_stable(
         StableError::owned_cuda_unsupported(),
         format!(
@@ -6195,7 +6205,7 @@ fn owned_cuda_evidence(state: &ModuleState, model: &EmbeddingModel) -> Option<Va
         return None;
     }
     let decision = owned_cuda_floor_decision(None);
-    let observed = owned_cuda_floor_observed(&decision);
+    let observed = owned_cuda_floor_observed(&decision, None);
     Some(json!({
         "engine": CUDA_WORKER_ENGINE,
         "backend": model.engine_identity.build_flags.get("backend"),
@@ -15164,6 +15174,64 @@ mod tests {
         }
         let error = run_owned_cuda_probe(&mut malformed, Duration::from_secs(2)).unwrap_err();
         assert!(error.contains("invalid CUDA floor probe JSON"), "{error}");
+    }
+
+    #[test]
+    fn cuda_floor_probe_cache_is_keyed_per_worker_binary() {
+        let root = std::env::temp_dir().join(format!(
+            "synapse-probe-key-{}-{}",
+            std::process::id(),
+            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let good = root.join(if cfg!(windows) { "good.cmd" } else { "good.sh" });
+        let bad = root.join(if cfg!(windows) { "bad.cmd" } else { "bad.sh" });
+        let header = if cfg!(windows) {
+            "@echo off\r\n"
+        } else {
+            "#!/bin/sh\n"
+        };
+        let json = r#"{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}"#;
+        let success = if cfg!(windows) {
+            format!("{header}echo {json}\r\n")
+        } else {
+            format!("{header}echo '{json}'\n")
+        };
+        fs::write(&good, &success).unwrap();
+        fs::write(
+            &bad,
+            format!(
+                "{header}echo missing-library >&2\n{}\n",
+                if cfg!(windows) { "exit /b 9" } else { "exit 9" }
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&good, &bad] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let failure = owned_cuda_probe_floor(Some(&bad)).unwrap_err();
+        assert!(failure.contains("missing-library"), "{failure}");
+        let reading = owned_cuda_probe_floor(Some(&good)).unwrap();
+        assert_eq!(
+            (
+                reading.driver_api,
+                reading.compute_major,
+                reading.compute_minor
+            ),
+            (13030, 8, 9)
+        );
+        // Failure caching is deliberate, but must not contaminate another worker.
+        fs::write(&bad, success).unwrap();
+        assert_eq!(owned_cuda_probe_floor(Some(&bad)).unwrap_err(), failure);
+        assert_eq!(
+            owned_cuda_probe_floor(Some(&good)).unwrap().driver_api,
+            13030
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

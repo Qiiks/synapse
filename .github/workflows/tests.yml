@@ -812,49 +812,19 @@ jobs:
           "@ | Set-Content build-gates/windows-x86_64-msvc-owned-cuda.txt
           if ($status -ne 0) { exit $status }
 
-      # Hollow-green guard for the compiled backend, with no PE-inspection
-      # dependency. `--features cuda` is the only thing that makes the build
-      # link cudart/cublas, and on Windows those are LOAD-TIME imports: an
-      # exe that imports them cannot start when they are absent from PATH
-      # (STATUS_DLL_NOT_FOUND, 0xC0000135) even though its --version path
-      # never calls into them. So the same probe answers both halves:
-      #   off-PATH must FAIL with 0xC0000135 -> the CUDA backend is baked in
-      #   on-PATH  must PASS                  -> the resolved DLL set is right
-      # A worker that silently compiled CPU-only prints --version both times,
-      # which this step refuses. It also records, in CI, the sidecar fact the
-      # release/installer PR must solve: the worker is not self-contained.
-      # Caveat: the discriminator depends on cudart/cublas staying load-time
-      # imports; if a future build moves them to delay-load, the off-PATH run
-      # exits 0 and this step reports "cuda feature is not compiled" — a false
-      # failure that points at the real cause rather than hiding it.
-      - name: Assert the packaged worker really carries the CUDA backend
+      # Derive sidecars from the same verified runtime components used to build.
+      # No independently maintained DLL manifest; nvcc and driver files are not
+      # redistribution inputs. The packager carries component licenses/hashes.
+      - name: Package and verify Windows CUDA sidecars
         working-directory: synapse
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
-          $exe = (Resolve-Path 'target/release/ck-synapse-worker-cuda.exe').Path
-          $isolated = Join-Path $env:RUNNER_TEMP 'cuda-isolated'
-          New-Item -ItemType Directory -Force $isolated | Out-Null
-          Copy-Item $exe $isolated
-          # PATH narrowed to the OS directories: no CUDA toolkit, no sidecars.
-          $env:PATH = "C:\Windows\system32;C:\Windows"
-          & (Join-Path $isolated 'ck-synapse-worker-cuda.exe') --version 2>&1 | Out-Null
-          $isolatedCode = $LASTEXITCODE
-          if ($isolatedCode -eq 0) {
-            throw "owned-CUDA worker ran without CUDA DLLs on PATH (exit 0): the cuda feature is not compiled into this binary — refusing to record a hollow-green gate"
-          }
-          if ($isolatedCode -ne -1073741515) {
-            throw "owned-CUDA worker failed off-PATH with exit $isolatedCode, expected -1073741515 (0xC0000135 STATUS_DLL_NOT_FOUND)"
-          }
-          # CUDA 13's redist layout keeps the runtime DLLs under bin\x64 (the
-          # nvcc drivers sit in bin); both directories are needed, as verified
-          # locally. With them restored the worker must start.
-          $env:PATH = "$env:CUDA_PATH\bin\x64;$env:CUDA_PATH\bin;C:\Windows\system32;C:\Windows"
-          & $exe --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "owned-CUDA worker --version failed with CUDA on PATH (exit $LASTEXITCODE)"
-          }
-          "cuda_import_probe=ok off_path=$isolatedCode on_path=0" >> $env:GITHUB_STEP_SUMMARY
+          ./scripts/package-owned-cuda.ps1 `
+            -Worker target/release/ck-synapse-worker-cuda.exe `
+            -RuntimeComponents @("$env:RUNNER_TEMP/x-cuda_cudart", "$env:RUNNER_TEMP/x-libcublas") `
+            -Output build-gates/owned-cuda-windows-x64.zip
+          ./scripts/test-owned-cuda-package.ps1 -Archive build-gates/owned-cuda-windows-x64.zip
+          'cuda_package_probe=passed; GPU execution requires a GPU runner' >> $env:GITHUB_STEP_SUMMARY
 
       - name: Retain Windows owned-CUDA gate evidence
         if: always()
