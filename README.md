@@ -110,6 +110,9 @@ and DLLs at the ZIP root, includes component licenses, and records source
 components and SHA-256 hashes in `manifest.json`. The NVIDIA driver is not
 bundled and must already be installed.
 
+Windows worker builds require CUDA 13. The build script rejects other toolkit
+major versions before linking, because this package resolves CUDA 13 DLL names.
+
 `scripts/test-owned-cuda-package.ps1 -Archive <zip> -RequireGpu` extracts a
 fresh copy, verifies hashes, and checks no-sidecar `--version`, actionable
 missing-library refusal, and a real hardware-floor probe with adjacent DLLs
