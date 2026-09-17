@@ -5388,7 +5388,7 @@ fn load_catalog_model_blocking(
                 spec.model_id
             )));
         }
-        ensure_owned_cuda_floor()?;
+        ensure_owned_cuda_floor(spec.worker_bin.as_deref())?;
     }
     let model_path = locator_path(&spec.model_locator, &model_cache)?;
     let tokenizer_path = locator_path(&spec.tokenizer_locator, &model_cache)?;
@@ -5991,7 +5991,7 @@ fn locator_path(
     }
 }
 
-fn owned_cuda_floor_decision() -> CudaFloorDecision {
+fn owned_cuda_floor_decision(worker: Option<&Path>) -> CudaFloorDecision {
     let driver_api = ["SYNAPSE_CUDA_DRIVER_API", "CUDA_DRIVER_API"]
         .into_iter()
         .find_map(|name| {
@@ -6008,12 +6008,137 @@ fn owned_cuda_floor_decision() -> CudaFloorDecision {
         });
     let packaging_driver = env::var("SYNAPSE_CUDA_PACKAGING_DRIVER").ok();
     let (Some(driver_api), Some((major, minor))) = (driver_api, compute) else {
-        return CudaFloorDecision::Unsupported {
-            reason: synapse_core::CudaUnsupportedReason::HardwareUnavailable,
-            observed: None,
+        // The environment is the override; when it is silent, ask the worker.
+        // The module deliberately does not link the CUDA driver, so the probe
+        // has to run in the worker process and report its numbers back.
+        return match owned_cuda_probe_floor(worker) {
+            Ok(reading) => evaluate_cuda_floor(
+                reading.driver_api,
+                reading.compute_major,
+                reading.compute_minor,
+                packaging_driver,
+            ),
+            Err(_) => CudaFloorDecision::Unsupported {
+                reason: synapse_core::CudaUnsupportedReason::HardwareUnavailable,
+                observed: None,
+            },
         };
     };
     evaluate_cuda_floor(driver_api, major, minor, packaging_driver)
+}
+
+/// A hardware reading reported by `ck-synapse-worker-cuda --probe-floor`.
+#[derive(Clone, Copy, Debug)]
+struct OwnedCudaFloorReading {
+    driver_api: u32,
+    compute_major: u32,
+    compute_minor: u32,
+}
+
+static OWNED_CUDA_PROBE: OnceLock<Result<OwnedCudaFloorReading, String>> = OnceLock::new();
+
+/// Cache one short-lived worker probe; a complete environment override skips it.
+fn owned_cuda_probe_floor(worker: Option<&Path>) -> &'static Result<OwnedCudaFloorReading, String> {
+    OWNED_CUDA_PROBE.get_or_init(|| {
+        let worker = worker
+            .map(Path::to_path_buf)
+            .or_else(|| env::var_os(worker_binary_env_var(CUDA_WORKER_ENGINE)).map(PathBuf::from))
+            .or_else(|| resolve_worker_binary_sibling(CUDA_WORKER_ENGINE))
+            .ok_or_else(|| "CUDA floor probe worker binary not found".to_string())?;
+        let mut command = std::process::Command::new(worker);
+        command.arg("--probe-floor");
+        run_owned_cuda_probe(&mut command, Duration::from_secs(10))
+    })
+}
+
+fn run_owned_cuda_probe(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> Result<OwnedCudaFloorReading, String> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn CUDA floor probe: {error}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1);
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take(4097).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = stdout_tx.send(result);
+    });
+    std::thread::spawn(move || {
+        let mut tail = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        while let Ok(count) = stderr.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            let discard = (tail.len() + count).saturating_sub(4096);
+            tail.drain(..discard);
+            tail.extend_from_slice(&chunk[..count]);
+        }
+        let _ = stderr_tx.send(String::from_utf8_lossy(&tail).into_owned());
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(match other {
+                    Err(error) => format!("wait for CUDA floor probe: {error}"),
+                    _ => "CUDA floor probe timed out".to_string(),
+                });
+            }
+        }
+    };
+    // Bound pipe completion too: a descendant may still hold an inherited pipe.
+    let stderr = stderr_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap_or_default();
+    let fail = |reason: String| format!("{reason}; stderr: {stderr}");
+    let status = status.map_err(&fail)?;
+    if !status.success() {
+        return Err(fail(format!("CUDA floor probe exited {status}")));
+    }
+    let stdout = stdout_rx
+        .recv_timeout(Duration::from_millis(100))
+        .map_err(|error| fail(format!("CUDA floor probe stdout: {error}")))?
+        .map_err(|error| fail(format!("read CUDA floor probe stdout: {error}")))?;
+    if stdout.len() > 4096 {
+        return Err(fail(
+            "CUDA floor probe stdout exceeds 4096 bytes".to_string(),
+        ));
+    }
+    let parsed: Value = serde_json::from_slice(&stdout)
+        .map_err(|error| fail(format!("invalid CUDA floor probe JSON: {error}")))?;
+    let reading = || {
+        Some(OwnedCudaFloorReading {
+            driver_api: parsed.get("driver_api")?.as_u64()?.try_into().ok()?,
+            compute_major: parsed
+                .get("compute_capability")?
+                .get("major")?
+                .as_u64()?
+                .try_into()
+                .ok()?,
+            compute_minor: parsed
+                .get("compute_capability")?
+                .get("minor")?
+                .as_u64()?
+                .try_into()
+                .ok()?,
+        })
+    };
+    reading().ok_or_else(|| fail("invalid CUDA floor probe hardware fields".to_string()))
 }
 
 fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
@@ -6023,21 +6148,41 @@ fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
     parts.next().is_none().then_some((major, minor))
 }
 
-fn ensure_owned_cuda_floor() -> Result<(), WireOperationError> {
-    let decision = owned_cuda_floor_decision();
+fn owned_cuda_floor_observed(decision: &CudaFloorDecision) -> Value {
+    floor_observed_with_probe_error(
+        decision,
+        OWNED_CUDA_PROBE
+            .get()
+            .and_then(|result| result.as_ref().err())
+            .map(String::as_str),
+    )
+}
+
+fn floor_observed_with_probe_error(decision: &CudaFloorDecision, error: Option<&str>) -> Value {
+    match decision {
+        CudaFloorDecision::Supported { observed }
+        | CudaFloorDecision::Unsupported {
+            observed: Some(observed),
+            ..
+        } => serde_json::to_value(observed).unwrap_or(Value::Null),
+        CudaFloorDecision::Unsupported { observed: None, .. } => error
+            .map(|stderr| json!({ "probe_stderr": stderr }))
+            .unwrap_or(Value::Null),
+    }
+}
+
+fn ensure_owned_cuda_floor(worker: Option<&Path>) -> Result<(), WireOperationError> {
+    let decision = owned_cuda_floor_decision(worker);
     if decision.is_supported() {
         return Ok(());
     }
-    let observed = match &decision {
-        CudaFloorDecision::Unsupported { observed, .. } => observed,
-        CudaFloorDecision::Supported { .. } => unreachable!(),
-    };
+    let observed = owned_cuda_floor_observed(&decision);
     Err(WireOperationError::from_stable(
         StableError::owned_cuda_unsupported(),
         format!(
             "owned-cuda floor refused before worker creation: decision={}, observed={}",
             decision.refusal_code().unwrap_or("owned_cuda_unsupported"),
-            serde_json::to_string(observed).unwrap_or_else(|_| "null".to_string()),
+            observed,
         ),
     ))
 }
@@ -6046,15 +6191,8 @@ fn owned_cuda_evidence(state: &ModuleState, model: &EmbeddingModel) -> Option<Va
     if model.engine_identity.engine != CUDA_WORKER_ENGINE {
         return None;
     }
-    let decision = owned_cuda_floor_decision();
-    let observed = match &decision {
-        CudaFloorDecision::Supported { observed }
-        | CudaFloorDecision::Unsupported {
-            observed: Some(observed),
-            ..
-        } => serde_json::to_value(observed).ok(),
-        CudaFloorDecision::Unsupported { observed: None, .. } => None,
-    };
+    let decision = owned_cuda_floor_decision(None);
+    let observed = owned_cuda_floor_observed(&decision);
     Some(json!({
         "engine": CUDA_WORKER_ENGINE,
         "backend": model.engine_identity.build_flags.get("backend"),
@@ -15003,6 +15141,62 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cuda_floor_probe_retains_child_failure_and_rejects_bad_json() {
+        let mut failed = std::process::Command::new(if cfg!(windows) { "cmd.exe" } else { "sh" });
+        if cfg!(windows) {
+            failed.args(["/D", "/C", "echo driver unavailable 1>&2 & exit /b 7"]);
+        } else {
+            failed.args(["-c", "echo 'driver unavailable' >&2; exit 7"]);
+        }
+        let error = run_owned_cuda_probe(&mut failed, Duration::from_secs(2)).unwrap_err();
+        assert!(error.contains("driver unavailable"), "{error}");
+        assert!(error.contains("exited"), "{error}");
+        let mut malformed =
+            std::process::Command::new(if cfg!(windows) { "cmd.exe" } else { "sh" });
+        if cfg!(windows) {
+            malformed.args(["/D", "/C", "echo invalid-json"]);
+        } else {
+            malformed.args(["-c", "echo invalid-json"]);
+        }
+        let error = run_owned_cuda_probe(&mut malformed, Duration::from_secs(2)).unwrap_err();
+        assert!(error.contains("invalid CUDA floor probe JSON"), "{error}");
+    }
+
+    #[test]
+    fn cuda_floor_probe_matches_real_worker_binary_output() {
+        let worker = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/release/ck-synapse-worker-cuda.exe");
+        if !worker.is_file() {
+            return; // release worker not staged on this host
+        }
+        let reading = run_owned_cuda_probe(
+            &mut std::process::Command::new(&worker),
+            Duration::from_secs(10),
+        )
+        .expect("real worker probe");
+        assert!(reading.driver_api >= synapse_core::OWNED_CUDA_MINIMUM_DRIVER_API);
+        assert!(
+            reading.compute_major as f32 + reading.compute_minor as f32 / 10.0
+                >= synapse_core::OWNED_CUDA_MINIMUM_DEVICE_CC
+        );
+    }
+
+    #[test]
+    fn cuda_floor_failure_evidence_preserves_stderr_without_fabricating_hardware() {
+        let unavailable = CudaFloorDecision::Unsupported {
+            reason: synapse_core::CudaUnsupportedReason::HardwareUnavailable,
+            observed: None,
+        };
+        let observed =
+            floor_observed_with_probe_error(&unavailable, Some("CUDA driver unavailable"));
+        assert_eq!(observed["probe_stderr"], "CUDA driver unavailable");
+        assert!(observed.get("driver_api").is_none());
+        let below_floor = evaluate_cuda_floor(11000, 8, 9, None);
+        let observed = floor_observed_with_probe_error(&below_floor, Some("stale error"));
+        assert_eq!(observed["driver_api"], 11000);
+        assert!(observed.get("probe_stderr").is_none());
+    }
 
     #[test]
     fn probe_report_separates_certification_from_serving_admission() {

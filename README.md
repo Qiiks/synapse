@@ -69,3 +69,34 @@ Example user-tier `~/.config/cortexkit/synapse.jsonc` (project configs must omit
 
 Tests can point at a file with `SYNAPSE_CONFIG_PATH`. Only one synapse module
 per machine (singleton lease); a second instance refuses to start.
+
+### Owned-CUDA hardware floor
+
+`ck-synapse-worker-cuda` implements `--probe-floor` (hidden, like the
+`--test-abort*` surfaces). It prints one JSON object and exits 0:
+
+```json
+{"driver_api": 13030, "compute_capability": {"major": 8, "minor": 9}}
+```
+
+The module probes the configured `worker_bin`, the engine's worker-binary
+environment override, or the sibling `ck-synapse-worker-cuda`, in that order.
+It caches one result per process unless both environment readings parse
+successfully. The child wait is bounded to 10 seconds; stdout is capped at
+4096 bytes and each pipe completion wait is bounded to another 100 ms.
+A missing binary, non-zero exit, timeout, or invalid output produces
+`HardwareUnavailable`. Refusal and model evidence carry diagnostic context,
+including the last 4096 bytes of stderr when available, under `observed`.
+Failed probes do not fabricate numeric hardware readings.
+
+The environment overrides the probe only as a complete, parseable pair.
+Otherwise both readings come from the probe; partial overrides are not merged:
+
+- `SYNAPSE_CUDA_DRIVER_API` (alias `CUDA_DRIVER_API`) — the raw CUDA **driver
+  API** integer from `cuDriverGetVersion()`, not the marketing driver version.
+  For example, a measured driver API value is `13030`. `610.88` is not a valid
+  API integer; without a parseable alias, it causes fallback to the probe.
+- `SYNAPSE_CUDA_COMPUTE_CAPABILITY` (alias `CUDA_COMPUTE_CAPABILITY`) — device
+  0's compute capability as `major.minor`, for example `8.9`.
+- `SYNAPSE_CUDA_PACKAGING_DRIVER` — optional; the driver string a packaging
+  build was tested against, carried into the refusal for diagnostics.

@@ -116,6 +116,51 @@ mod enabled {
         Ok(())
     }
 
+    /// Read the driver API version and device 0's compute capability.
+    ///
+    /// This runs before an owned-CUDA load is admitted, so it deliberately
+    /// touches nothing else: no context is retained, no model is loaded, and
+    /// no weights are mapped. The reading is what the floor predicate is
+    /// applied to, which is why it reports the raw numbers rather than a
+    /// verdict.
+    pub fn probe_hardware_floor() -> Result<crate::HardwareFloorProbe> {
+        cuda_driver_check(unsafe { cuInit(0) }, "cuInit")?;
+        let mut driver_api = 0;
+        cuda_driver_check(
+            unsafe { cuDriverGetVersion(&mut driver_api) },
+            "cuDriverGetVersion",
+        )?;
+        let mut device = 0;
+        cuda_driver_check(unsafe { cuDeviceGet(&mut device, 0) }, "cuDeviceGet")?;
+        let mut major = 0;
+        cuda_driver_check(
+            unsafe {
+                cuDeviceGetAttribute(
+                    &mut major,
+                    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    device,
+                )
+            },
+            "cuDeviceGetAttribute(COMPUTE_CAPABILITY_MAJOR)",
+        )?;
+        let mut minor = 0;
+        cuda_driver_check(
+            unsafe {
+                cuDeviceGetAttribute(
+                    &mut minor,
+                    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    device,
+                )
+            },
+            "cuDeviceGetAttribute(COMPUTE_CAPABILITY_MINOR)",
+        )?;
+        Ok(crate::HardwareFloorProbe {
+            driver_api: driver_api as u32,
+            compute_major: major as u32,
+            compute_minor: minor as u32,
+        })
+    }
+
     pub struct MiniLmContext {
         binding: DeviceBinding,
         raw: NonNull<c_void>,
@@ -465,8 +510,16 @@ mod enabled {
         }
     }
 
+    /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR` from `cuda.h`.
+    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+    /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR` from `cuda.h`.
+    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
+
     unsafe extern "C" {
         fn cuInit(flags: u32) -> i32;
+        fn cuDriverGetVersion(version: *mut i32) -> i32;
+        fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32;
+        fn cuDeviceGetAttribute(value: *mut i32, attrib: i32, device: i32) -> i32;
         fn cuCtxGetDevice(device: *mut i32) -> i32;
         fn cuCtxSetCurrent(context: *mut c_void) -> i32;
         fn cuDevicePrimaryCtxRetain(context: *mut *mut c_void, device: i32) -> i32;
@@ -551,6 +604,10 @@ mod enabled {
         bail!("owned CUDA requires a non-macOS build with cargo feature `cuda`")
     }
 
+    pub fn probe_hardware_floor() -> Result<crate::HardwareFloorProbe> {
+        bail!("owned CUDA requires a non-macOS build with cargo feature `cuda`")
+    }
+
     pub struct MiniLmContext;
     impl MiniLmContext {
         pub fn new(_graphs: bool) -> Result<Self> {
@@ -629,4 +686,6 @@ mod enabled {
     }
 }
 
-pub use enabled::{ensure_available, MiniLmContext, ModernBertContext, Qwen3Context};
+pub use enabled::{
+    ensure_available, probe_hardware_floor, MiniLmContext, ModernBertContext, Qwen3Context,
+};
