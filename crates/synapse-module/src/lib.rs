@@ -6082,9 +6082,10 @@ struct OwnedCudaFloorReading {
     compute_minor: u32,
 }
 
-static OWNED_CUDA_PROBE: std::sync::LazyLock<
-    Mutex<HashMap<PathBuf, Result<OwnedCudaFloorReading, String>>>,
-> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+type OwnedCudaProbeEntry = Arc<OnceLock<Result<OwnedCudaFloorReading, String>>>;
+
+static OWNED_CUDA_PROBE: std::sync::LazyLock<Mutex<HashMap<PathBuf, OwnedCudaProbeEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Cache successes and failures per worker; a complete environment override skips it.
 fn owned_cuda_probe_floor(worker: Option<&Path>) -> Result<OwnedCudaFloorReading, String> {
@@ -6094,14 +6095,17 @@ fn owned_cuda_probe_floor(worker: Option<&Path>) -> Result<OwnedCudaFloorReading
         .or_else(|| resolve_worker_binary_sibling(CUDA_WORKER_ENGINE))
         .ok_or_else(|| "CUDA floor probe worker binary not found".to_string())?;
     let worker = fs::canonicalize(&worker).unwrap_or(worker);
-    let mut cache = OWNED_CUDA_PROBE
+    let entry = OWNED_CUDA_PROBE
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Failed probes stay cached deliberately until module restart, for this worker only.
-    cache
-        .entry(worker)
-        .or_insert_with_key(|worker| {
-            let mut command = std::process::Command::new(worker);
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(worker.clone())
+        .or_default()
+        .clone();
+    // Only callers for this worker wait; unrelated workers can probe concurrently.
+    // Failed probes stay cached deliberately until module restart.
+    entry
+        .get_or_init(|| {
+            let mut command = std::process::Command::new(&worker);
             command.arg("--probe-floor");
             run_owned_cuda_probe(&mut command, Duration::from_secs(10))
         })
@@ -15330,6 +15334,75 @@ mod tests {
         assert_eq!(owned_cuda_probe_floor(Some(&bad)).unwrap_err(), failure);
         assert_eq!(
             owned_cuda_probe_floor(Some(&good)).unwrap().driver_api,
+            13030
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cuda_floor_probe_slow_worker_does_not_block_other_workers() {
+        let root = std::env::temp_dir().join(format!(
+            "synapse-probe-slow-{}-{}",
+            std::process::id(),
+            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let ready = root.join("ready");
+        let release = root.join("release");
+        let slow = root.join(if cfg!(windows) { "slow.cmd" } else { "slow.sh" });
+        let quick = root.join(if cfg!(windows) {
+            "quick.cmd"
+        } else {
+            "quick.sh"
+        });
+        let json = r#"{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}"#;
+        let stalled = if cfg!(windows) {
+            format!(
+                "@echo off\r\necho ready >\"{}\"\r\n:wait\r\nif exist \"{}\" goto done\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:done\r\necho {json}\r\n",
+                ready.display(), release.display()
+            )
+        } else {
+            format!(
+                "#!/bin/sh\nprintf ready >'{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\necho '{json}'\n",
+                ready.display(), release.display()
+            )
+        };
+        let success = if cfg!(windows) {
+            format!("@echo off\r\necho {json}\r\n")
+        } else {
+            format!("#!/bin/sh\necho '{json}'\n")
+        };
+        fs::write(&slow, stalled).unwrap();
+        fs::write(&quick, success).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&slow, &quick] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let stalled = std::thread::spawn(move || owned_cuda_probe_floor(Some(&slow)));
+        let ready_deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let confirmed_ready = ready.exists();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let _ = tx.send(owned_cuda_probe_floor(Some(&quick)));
+        });
+        // The quick probe must finish while the first worker is still blocked.
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        fs::write(&release, "release").unwrap();
+        let stalled_result = stalled.join().unwrap();
+        other.join().unwrap();
+        assert!(confirmed_ready, "stalled worker did not signal readiness");
+        assert_eq!(stalled_result.unwrap().driver_api, 13030);
+        assert_eq!(
+            result
+                .expect("unrelated probe blocked behind stalled worker")
+                .unwrap()
+                .driver_api,
             13030
         );
         fs::remove_dir_all(root).unwrap();
