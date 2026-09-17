@@ -439,3 +439,181 @@ The eviction was observed: between forward 2 and forward 3, device memory droppe
 - Measured total spend: **$1.2151444** (GPU charges: $1.181; storage: $0.030; network download: $0.004; invoice total $1.215). Well within the $3.00 budget cap.
 - Instance `51297726` was destroyed with `vastai destroy instance 51297726`.
 - Post-destruction verification: `vastai show instances-v1` returned `Total: 0 instances` with `No instances found`. No rented instance was left running.
+
+## PR #19 owned-CUDA `model.load` restart verification (`95f0a4755dde`)
+
+Date: 2026-09-17 UTC
+
+### Result
+
+PR #19, merged cleanly onto `origin/master` at `1abeed4db555be6a147830595319b939fd02c31a` as `7de9c576e1535b6db7f2665dfbdeb714981e88fa`, fixes the boot-blocking catalog defect. The candidate persisted the owned-CUDA family, dtype, and config locator; after a clean module stop/start it booted with the row present. The same restart on `master` exhausted the supervisor restart budget with the exact refusal:
+
+```text
+synapse boot failed after HELLO_ACK: config: owned-cuda catalog entry is missing family
+```
+
+The requested sequence did **not** pass end to end without qualifications:
+
+1. On `master`, `model.load` persisted the malformed row but failed before reaching `ready`: the worker refused the digest-named bare cache blob because it was neither a directory nor a path ending in `.safetensors`. Consequently the requested pre-restart master embed could not be run. The persisted row still made the traced restart defect reachable, and the restart refused exactly as predicted.
+2. The candidate reached `ready`, served a real 1,024-component CUDA embed before restart, and booted after restart. Its first post-restart embed without a new `model.load` was nevertheless refused as `not_certified`. The machine-profile hash changed from `5bd8f57d...` before restart to `958655e8...` after the catalog gained the CUDA identity, so the pre-restart certification row no longer matched. The required post-restart probe certified the new profile, after which the same embed succeeded without another `model.load`. Thus PR #19 fixes restart normalization and package assembly, but the strict step-4 requirement—embed success after restart and before a new probe—was not met.
+
+The candidate's post-restart certification probe completed in **4.007 s**, recorded real `cuda` evidence, and did not hang. Both requested unit tests passed.
+
+### Rig, inputs, and isolation
+
+A single on-demand Vast.ai instance was rented:
+
+- Instance ID: `51319265`
+- Host ID: `208874`, Machine ID: `123134`, Delaware, US; observed host reliability `0.998456`
+- Rental rate: `$0.3733333333/hour` GPU + `$0.0388888889/hour` storage = `$0.4122222222/hour`
+- Image/OS: `nvidia/cuda:12.4.1-devel-ubuntu22.04`, Ubuntu 22.04.4 LTS, kernel `6.8.0-117-generic`, x86_64
+- CPU: AMD EPYC 7K62 48-Core Processor; 24 effective vCPUs in the Vast allocation; 503 GiB host RAM visible
+- GPU: NVIDIA GeForce RTX 4090, 24,564 MiB, compute capability 8.9
+- GPU UUID: `GPU-9ed2b4a8-f228-873c-b8ac-e663217595f4`
+- NVIDIA driver: `580.126.20`; CUDA driver API observed by the probe: `13000`
+- CUDA toolkit: 12.4 (`nvcc` 12.4.131, `Build cuda_12.4.r12.4/compiler.34097967_0`)
+- Control: `origin/master` at `1abeed4db555be6a147830595319b939fd02c31a`
+- PR head: `95f0a4755ddef00bd9ba93176253d19002c1cac5`
+- Candidate merge: `7de9c576e1535b6db7f2665dfbdeb714981e88fa`
+- Siblings: `subconscious` `4a258064f584c2696c8c1294c07652911ed828aa`; `commons` `a03b9621b57e0674a305e8558ce20ef811ceae89`
+- Model: `Qwen/Qwen3-Embedding-0.6B` revision `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`
+- `model.safetensors` SHA-256: `0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd`
+- Probe corpus: the built-in 64-row `probe_corpus_qwen3_embedding_fp32.json`, with independent CPU-f32 reference vectors
+
+Each tree ran under its own scratch root. The daemon had an isolated `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, and sqlite `data_home`; the module had an explicit config containing `{"preload_models":[]}`, an isolated `XDG_DATA_HOME`, cache/home, and lease root. No ambient daemon or catalog was used. Both initial `models list` calls exited 0 with:
+
+```json
+{"result":{"alias_rows":[],"models":[],"module_generation":1,"table_epoch":0}}
+```
+
+### Builds and command ledger
+
+The CUDA worker was built from each tree with the requested feature:
+
+```text
+cargo build --locked -p synapse-worker-cuda --no-default-features --features cuda --release
+```
+
+Both invocations exited 0. `synapse-module` itself has no `cuda` Cargo feature, so the module and operator tool were built with:
+
+```text
+cargo build --locked -p synapse-module -p synapse-opctl --release
+```
+
+On Ubuntu 22.04, the first control module link exited 101 because the ORT rc.11 static archive referenced glibc 2.38's `__isoc23_strtol`, `__isoc23_strtoll`, and `__isoc23_strtoull`, while the image carries glibc 2.35. A compatibility object mapping those symbols to the corresponding glibc 2.35 functions was linked identically into both module builds with `RUSTFLAGS='-C link-arg=/root/work/isoc23_compat.o'`. The control retry and candidate module build both exited 0. This shim affects number parsing at the ORT link boundary only; the exercised owned-CUDA path runs in the supervised CUDA worker.
+
+| Tree / step | Command | Exit | Relevant outcome |
+|---|---|---:|---|
+| Control build | `cargo build --locked -p synapse-worker-cuda --no-default-features --features cuda --release` | 0 | CUDA worker built |
+| Control module, first link | `cargo build --locked -p synapse-module -p synapse-opctl --release` | 101 | Missing `__isoc23_strto*` symbols from the ORT archive |
+| Control module, compatibility retry | `RUSTFLAGS='-C link-arg=/root/work/isoc23_compat.o' cargo build --locked -p synapse-module -p synapse-opctl --release` | 0 | Module and opctl built |
+| Candidate build | `cargo build --locked -p synapse-worker-cuda --no-default-features --features cuda --release` | 0 | CUDA worker built from merged tree |
+| Candidate module | `RUSTFLAGS='-C link-arg=/root/work/isoc23_compat.o' cargo build --locked -p synapse-module -p synapse-opctl --release` | 0 | Module and opctl built |
+| Control step 1 | `ck-synapse-opctl ... models list` | 0 | Empty catalog |
+| Control step 2 submit | `ck-synapse-opctl ... model load --manifest ...` | 0 | `job_458e63113402ed944fc6c427e6cb5e1b` queued |
+| Control step 2 terminal status | `ck-synapse-opctl ... model status job_458e...` | 1 | `state: failed`, `artifact_invalid` |
+| Candidate step 1 | `ck-synapse-opctl ... models list` | 0 | Empty catalog |
+| Candidate step 2 submit/status | `model load`, then `model status job_260a...` | 0 / 0 | `state: ready` |
+| Candidate certification prerequisite | `probe run --lane qwen3-embedding-0.6b`, then `probe status` | 0 / 0 | `state: done`, certified in 3.440 s |
+| Candidate step 3 | `embed batch --model qwen3-embedding-0.6b ...` | 0 | 1 vector, 1,024 dimensions, `owned-cuda` |
+| Control step 4 | `ck module stop synapse`, `ck module start synapse` | 0 / 0 | Clean exit recorded, then supervisor state `failed` |
+| Candidate step 4 | `ck module stop synapse`, `ck module start synapse` | 0 / 0 | Clean exit recorded, candidate booted with module generation 2 |
+| Candidate step-4 embed before probe | `embed batch --model qwen3-embedding-0.6b ...` | 1 | `not_certified` for the new machine-profile hash |
+| Candidate step 5 | `probe run --lane qwen3-embedding-0.6b`, then `probe status` | 0 / 0 | `state: done` in 4.007 s; CUDA evidence present |
+| Candidate probe report | `ck-synapse-opctl ... probe report` | 0 | Report retained the CUDA evidence below |
+| Candidate post-probe embed | same `embed batch`, no intervening `model.load` | 0 | 1 vector, 1,024 dimensions, `owned-cuda`, module generation 2 |
+
+### Persisted catalog rows
+
+The requested literal query was run on both stores:
+
+```text
+sqlite3 <store.db> "select model_id, engine, owned_family, owned_dtype, config_locator from models"
+```
+
+It exited 1 on both trees with `Error: in prepare, no such column: owned_family (1)`. At these commits, `models` has top-level columns `model_id`, `engine`, `task`, `fingerprint`, `config_json`, `created_ms`, and `updated_ms`; the requested owned fields live inside `config_json`. The equivalent query using `json_extract` exited 0 and produced these verbatim rows:
+
+```text
+master:
+qwen3-embedding-0.6b|owned-cuda|||
+
+candidate before restart:
+qwen3-embedding-0.6b|owned-cuda|qwen3-0.6b|f16|{"kind":"cache_digest","digest":"sha256:b5bf1f51fc45be473a54718cef92448d90a1be001bf9b9a44b8c7f10a19feaa9"}
+
+candidate after restart:
+qwen3-embedding-0.6b|owned-cuda|qwen3-0.6b|f16|{"kind":"cache_digest","digest":"sha256:b5bf1f51fc45be473a54718cef92448d90a1be001bf9b9a44b8c7f10a19feaa9"}
+```
+
+The control's terminal load status was:
+
+```json
+{"result":{"error":{"class":"permanent","code":"artifact_invalid","message":"worker returned artifact_invalid: owned-cuda model package: model path /root/.local/share/cortexkit/models/blobs/0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd is neither a directory nor a safetensors file","safe_to_retry_same_request":false},"job_id":"job_458e63113402ed944fc6c427e6cb5e1b","module_generation":1,"request_key":"pr19-master-owned-cuda-load","state":"failed"}}
+```
+
+The candidate's terminal load status was `state: "ready"`, model `qwen3-embedding-0.6b`, fingerprint `9ad405e204f9c59cb9c8177346499d0bc326dcffb3e5c6a9b7ff3946e3cff8ee`. Its pre-restart embed returned one 1,024-component vector with the same fingerprint and `provenance.engine.engine: "owned-cuda"`.
+
+### Restart outcomes
+
+The control stop was clean (`last_exit_code: 0`, `last_exit_kind: "clean"`). Starting it on the unchanged data home produced supervisor state `failed`, exit code 101, after all four permitted launches printed:
+
+```text
+synapse boot failed after HELLO_ACK: config: owned-cuda catalog entry is missing family
+```
+
+The candidate stop was also clean. Starting it on the unchanged data home reached `state: "running"`, `live: true`; `models list` returned the persisted model as `state: "unloaded"`, `device_class: "cuda"`, `dtype: "f16"`, and the catalog row remained byte-for-byte the row shown above. The first embed triggered lazy reload but then exited 1 with:
+
+```json
+{"result":{"error":{"class":"permanent","code":"not_certified","message":"owned-cuda fingerprint 9ad405e204f9c59cb9c8177346499d0bc326dcffb3e5c6a9b7ff3946e3cff8ee is not certified on machine profile 958655e870c01959772cc3568be7c265009f8da8048afbb6c710b10914044aff","safe_to_retry_same_request":false},"module_generation":2}}
+```
+
+This is why the candidate's required pre-probe post-restart embed is recorded as failed rather than presented as a pass. After step 5 certified that profile, the embed exited 0 without another `model.load`: one vector, 1,024 dimensions, fingerprint `9ad405e2...`, `owned-cuda`, module generation 2.
+
+### Candidate probe and unit tests
+
+The post-restart `probe run` plus terminal `probe status` took **4.007 s** wall time and completed with `state: "done"`. `probe report` included:
+
+```json
+{
+  "cuda": {
+    "backend": "cuda-ptx",
+    "cold_load_ms": 6086.954617,
+    "engine": "owned-cuda",
+    "floor_refusal": null,
+    "floor_state": "supported",
+    "minimum_cuda_driver_api": "12040",
+    "minimum_device_cc": "7.5",
+    "observed": {
+      "compute_capability": 8.899999618530273,
+      "driver_api": 13000
+    },
+    "ptx_virtual_arch": "compute_75",
+    "resident_process_count": 1
+  }
+}
+```
+
+The lane was `certified` over all 64 items with mean cosine `0.9999977120852748`, rank overlap `1.0`, and worst-decile overlap `1.0`.
+
+Requested tests (both ran with the same `RUSTFLAGS='-C link-arg=/root/work/isoc23_compat.o'` compatibility environment described above):
+
+```text
+$ cargo test -p synapse-module --lib owned_cuda_model_load_persists_owned_profile_and_assembles_package -- --nocapture
+running 1 test
+test tests::owned_cuda_model_load_persists_owned_profile_and_assembles_package ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 440 filtered out
+
+$ cargo test -p synapse-module --lib cuda_certification_evidence_uses_model_worker_without_blocking -- --nocapture
+running 1 test
+test tests::cuda_certification_evidence_uses_model_worker_without_blocking ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 440 filtered out; finished in 2.19s
+```
+
+Both commands exited 0.
+
+### Spend and teardown
+
+- Vast credit before rental: `$10.214409287300413`
+- Vast credit after destruction: `$10.011962425200409`
+- Measured total spend: **$0.2024468621**, within the `$3.00` cap
+- Instance `51319265` was destroyed with `vastai destroy instance 51319265 -y --raw` after the evidence archive was copied off-host; the command exited 0.
+- Post-destruction `vastai show instances-v1 --raw` returned `"instances_found": 0`, `"total_instances": 0`, and `"instances": []`. The legacy inventory also returned `[]`. No rented instance was left running.
