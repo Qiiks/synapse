@@ -6055,6 +6055,7 @@ fn run_owned_cuda_probe(
     command: &mut std::process::Command,
     timeout: Duration,
 ) -> Result<OwnedCudaFloorReading, String> {
+    let deadline = std::time::Instant::now() + timeout;
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -6084,12 +6085,14 @@ fn run_owned_cuda_probe(
         }
         let _ = stderr_tx.send(String::from_utf8_lossy(&tail).into_owned());
     });
-    let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(
+                    Duration::from_millis(20)
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
             }
             other => {
                 let _ = child.kill();
@@ -6103,7 +6106,7 @@ fn run_owned_cuda_probe(
     };
     // Bound pipe completion too: a descendant may still hold an inherited pipe.
     let stderr = stderr_rx
-        .recv_timeout(Duration::from_millis(100))
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
         .unwrap_or_default();
     let fail = |reason: String| format!("{reason}; stderr: {stderr}");
     let status = status.map_err(&fail)?;
@@ -6111,7 +6114,7 @@ fn run_owned_cuda_probe(
         return Err(fail(format!("CUDA floor probe exited {status}")));
     }
     let stdout = stdout_rx
-        .recv_timeout(Duration::from_millis(100))
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
         .map_err(|error| fail(format!("CUDA floor probe stdout: {error}")))?
         .map_err(|error| fail(format!("read CUDA floor probe stdout: {error}")))?;
     if stdout.len() > 4096 {
@@ -15164,14 +15167,26 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a staged CUDA worker and supported GPU; run explicitly"]
     fn cuda_floor_probe_matches_real_worker_binary_output() {
-        let worker = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../target/release/ck-synapse-worker-cuda.exe");
-        if !worker.is_file() {
-            return; // release worker not staged on this host
-        }
+        let worker = env::var_os("SYNAPSE_TEST_CUDA_WORKER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/release")
+                    .join(if cfg!(windows) {
+                        "ck-synapse-worker-cuda.exe"
+                    } else {
+                        "ck-synapse-worker-cuda"
+                    })
+            });
+        assert!(
+            worker.is_file(),
+            "stage CUDA worker at {}",
+            worker.display()
+        );
         let reading = run_owned_cuda_probe(
-            &mut std::process::Command::new(&worker),
+            std::process::Command::new(&worker).arg("--probe-floor"),
             Duration::from_secs(10),
         )
         .expect("real worker probe");

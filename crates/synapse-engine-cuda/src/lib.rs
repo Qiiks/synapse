@@ -189,7 +189,7 @@ pub fn build_identity(family: ModelFamily, dtype: StorageDType) -> CudaBuildIden
 ///
 /// Carried separately from [`device_meets_floor`] so the caller can log or
 /// refuse on the observed values rather than on a bare boolean.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HardwareFloorProbe {
     pub driver_api: u32,
     pub compute_major: u32,
