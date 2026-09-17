@@ -28,7 +28,11 @@ try {
         New-Item -ItemType Directory -Force $licenseDir | Out-Null
         $licenses = @(Get-ChildItem $root -Recurse -File | Where-Object { $_.Name -match '^(LICENSE|EULA|COPYING)' })
         if (!$licenses.Count) { throw "Missing redistribution license in $root" }
-        foreach ($license in $licenses) { Copy-Item $license.FullName $licenseDir }
+        foreach ($license in $licenses) {
+            $destination = Join-Path $licenseDir $license.FullName.Substring($root.Length + 1)
+            New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
+            Copy-Item $license.FullName $destination
+        }
     }
     [ordered]@{
         schema = 1

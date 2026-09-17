@@ -44,6 +44,9 @@ try {
     if ($present.Code -eq 0) {
         $floor = $present.Out | ConvertFrom-Json
         if ($floor.driver_api -le 0 -or $floor.compute_capability.major -le 0) { throw 'Invalid floor JSON' }
+        if ($RequireGpu -and ($floor.driver_api -lt 12040 -or $floor.compute_capability.major -lt 7 -or ($floor.compute_capability.major -eq 7 -and $floor.compute_capability.minor -lt 5))) {
+            throw 'GPU below owned-CUDA floor: driver API >= 12040 and compute capability >= 7.5 required'
+        }
         Write-Output "PASS packaged GPU probe: $($present.Out.Trim())"
     } elseif ($RequireGpu) {
         throw "Packaged GPU probe failed: $($present.Code) $($present.Err)"
