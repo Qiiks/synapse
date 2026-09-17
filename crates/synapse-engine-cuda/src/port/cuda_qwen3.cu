@@ -559,11 +559,11 @@ int32_t synapse_cuda_qwen3_forward(
             auto plan = std::make_unique<ShapePlan>(context, batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon, rope_theta);
             plan->initialize_and_verify(token_ids, attention_mask);
             found = context->plans.emplace(key, std::move(plan)).first;
+            // Keep map and LRU membership aligned even if run() throws.
+            context->touch_plan(key);
         }
-        // Retain at most max_plans shape plans. Order matters: the touch runs
-        // after run() has returned from cudaStreamSynchronize, so the stream
-        // is idle, the just-executed plan is most-recently-used, and a
-        // victim's buffers are freed while no kernel references them.
+        // Promote successful cache hits after the stream is idle. New plans
+        // are already tracked above so a failed run cannot orphan an arena.
         found->second->run(token_ids, attention_mask, output);
         context->touch_plan(key);
         return 0;
