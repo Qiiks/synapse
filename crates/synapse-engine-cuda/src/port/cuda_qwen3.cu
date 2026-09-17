@@ -1,6 +1,7 @@
 #include "cuda_family_common.cuh"
 
 #include <cfloat>
+#include <list>
 #include <cstdio>
 
 using namespace synapse_cuda_family;
@@ -246,6 +247,31 @@ struct QwenContext {
     DeviceAllocation<half> embeddings;
     bool embeddings_loaded = false;
     std::unordered_map<std::string, std::unique_ptr<ShapePlan>> plans;
+    // Bounded shape-plan retention. Every forward returns only after
+    // cudaStreamSynchronize on this context's single stream, so the stream is
+    // idle at the FFI boundary and a dropped plan frees buffers no kernel is
+    // still referencing. Retain two warm embedding shapes; misses evict
+    // before allocation so a third full arena cannot raise the cache peak.
+    static constexpr size_t max_plans = 2;
+    std::list<std::string> plan_lru;
+
+    // Promotes `key` to most-recently-used, then trims the
+    // least-recently-used plan until at most max_plans remain. The guard
+    // makes the invariant explicit: forward only touches a key it just
+    // inserted or found, so the just-used plan is at the front and is never
+    // the eviction victim. Erasing a map entry destroys the unique_ptr,
+    // running ShapePlan::~ShapePlan: graph_exec, then graph, then every
+    // DeviceAllocation (cudaFree) via their own destructors.
+    void touch_plan(const std::string &key) {
+        if (plans.find(key) == plans.end()) return;
+        plan_lru.remove(key);
+        plan_lru.push_front(key);
+        while (plan_lru.size() > max_plans) {
+            std::string victim = plan_lru.back();
+            plan_lru.pop_back();
+            plans.erase(victim);
+        }
+    }
 
     explicit QwenContext(bool graphs) : graphs_enabled(graphs) {
         FAMILY_CUDA_CHECK(cudaFree(nullptr));
@@ -253,6 +279,7 @@ struct QwenContext {
         FAMILY_CUBLAS_CHECK(cublasLtCreate(&lt));
     }
     ~QwenContext() {
+        plan_lru.clear();
         plans.clear();
         if (lt) cublasLtDestroy(lt);
         if (stream) cudaStreamDestroy(stream);
@@ -523,11 +550,22 @@ int32_t synapse_cuda_qwen3_forward(
         std::string key = shape_key(batch, seq);
         auto found = context->plans.find(key);
         if (found == context->plans.end()) {
+            if (context->plans.size() >= QwenContext::max_plans) {
+                FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
+                const std::string victim = context->plan_lru.back();
+                context->plan_lru.pop_back();
+                context->plans.erase(victim);
+            }
             auto plan = std::make_unique<ShapePlan>(context, batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon, rope_theta);
             plan->initialize_and_verify(token_ids, attention_mask);
             found = context->plans.emplace(key, std::move(plan)).first;
+            // Keep map and LRU membership aligned even if run() throws.
+            context->touch_plan(key);
         }
+        // Promote successful cache hits after the stream is idle. New plans
+        // are already tracked above so a failed run cannot orphan an arena.
         found->second->run(token_ids, attention_mask, output);
+        context->touch_plan(key);
         return 0;
     } catch (const std::exception &error) {
         synapse_cuda_set_last_error(error.what());
