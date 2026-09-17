@@ -2499,7 +2499,7 @@ fn normalize_catalog_model(
             identity_override: None,
         })
     } else if engine_name == CUDA_WORKER_ENGINE {
-        Some(owned_cuda_catalog_config(
+        let mut profile = owned_cuda_catalog_config(
             model.owned_family.as_deref(),
             model.owned_dtype.as_deref(),
             model.owned_execution.as_deref(),
@@ -2526,7 +2526,10 @@ fn normalize_catalog_model(
                     .get("minimum_cuda_driver_api")
                     .and_then(|value| value.parse().ok()),
             },
-        )?)
+        )?;
+        profile.config_locator = model.config_locator.clone();
+        profile.extra_locators = model.extra_locators.clone();
+        Some(profile)
     } else {
         None
     };
@@ -5280,33 +5283,71 @@ async fn load_catalog_model_task(
 fn stored_owned_profile(
     spec: &StoredModelConfig,
 ) -> Result<Option<OwnedCatalogConfig>, WireOperationError> {
-    if spec.engine != "owned-metal" {
-        return Ok(None);
+    if spec.engine == "owned-metal" {
+        let family = spec
+            .owned_family
+            .as_deref()
+            .ok_or_else(|| artifact_invalid_error("owned-metal catalog entry is missing family"))?;
+        let dtype = spec
+            .owned_dtype
+            .as_deref()
+            .ok_or_else(|| artifact_invalid_error("owned-metal catalog entry is missing dtype"))?;
+        return Ok(Some(OwnedCatalogConfig {
+            family: OwnedFamily::parse(family)
+                .map_err(|error| artifact_invalid_error(error.to_string()))?,
+            dtype: OwnedDType::parse(dtype)
+                .map_err(|error| artifact_invalid_error(error.to_string()))?,
+            execution: spec
+                .owned_execution
+                .clone()
+                .unwrap_or_else(|| "explicit".to_string()),
+            attention_units: spec
+                .owned_attention_units
+                .unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
+            config_locator: spec.config_locator.clone(),
+            extra_locators: spec.extra_locators.clone(),
+            identity_override: None,
+        }));
     }
-    let family = spec
-        .owned_family
-        .as_deref()
-        .ok_or_else(|| artifact_invalid_error("owned-metal catalog entry is missing family"))?;
-    let dtype = spec
-        .owned_dtype
-        .as_deref()
-        .ok_or_else(|| artifact_invalid_error("owned-metal catalog entry is missing dtype"))?;
-    Ok(Some(OwnedCatalogConfig {
-        family: OwnedFamily::parse(family)
-            .map_err(|error| artifact_invalid_error(error.to_string()))?,
-        dtype: OwnedDType::parse(dtype)
-            .map_err(|error| artifact_invalid_error(error.to_string()))?,
-        execution: spec
-            .owned_execution
-            .clone()
-            .unwrap_or_else(|| "explicit".to_string()),
-        attention_units: spec
-            .owned_attention_units
-            .unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
-        config_locator: spec.config_locator.clone(),
-        extra_locators: spec.extra_locators.clone(),
-        identity_override: None,
-    }))
+    if spec.engine == CUDA_WORKER_ENGINE {
+        // A persisted owned-cuda row carries the same owned_*/config/extra
+        // fields as metal; rebuild through the CUDA builder so the engine
+        // identity and floors are re-derived from the stored build flags
+        // instead of a second hand-rolled profile.
+        let mut profile = owned_cuda_catalog_config(
+            spec.owned_family.as_deref(),
+            spec.owned_dtype.as_deref(),
+            spec.owned_execution.as_deref(),
+            spec.owned_attention_units,
+            OwnedCudaDeclaredIdentity {
+                kernel_revision: spec
+                    .engine_identity
+                    .build_flags
+                    .get("kernel_revision")
+                    .map(String::as_str),
+                ptx_virtual_arch: spec
+                    .engine_identity
+                    .build_flags
+                    .get("ptx_virtual_arch")
+                    .map(String::as_str),
+                minimum_device_cc: spec
+                    .engine_identity
+                    .build_flags
+                    .get("minimum_device_cc")
+                    .and_then(|value| value.parse().ok()),
+                minimum_cuda_driver_api: spec
+                    .engine_identity
+                    .build_flags
+                    .get("minimum_cuda_driver_api")
+                    .and_then(|value| value.parse().ok()),
+            },
+        )
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+        profile.config_locator = spec.config_locator.clone();
+        profile.extra_locators = spec.extra_locators.clone();
+        return Ok(Some(profile));
+    }
+    Ok(None)
 }
 
 fn assemble_owned_model_package(
@@ -5323,15 +5364,22 @@ fn assemble_owned_model_package(
         return Ok(model_path.to_path_buf());
     }
     if !profile.extra_locators.is_empty() {
-        return Err(artifact_invalid_error(
-            "sharded owned-metal packages are reserved but not supported in wave 1",
-        ));
+        return Err(artifact_invalid_error(format!(
+            "sharded {} packages are reserved but not supported in wave 1",
+            spec.engine
+        )));
     }
     let config_locator = profile.config_locator.as_ref().ok_or_else(|| {
-        artifact_invalid_error("owned-metal model package is missing files.config")
+        artifact_invalid_error(format!(
+            "{} model package is missing files.config",
+            spec.engine
+        ))
     })?;
     let config = locator_path(config_locator, model_cache)?;
     let package_key = spec.artifact_digest.trim_start_matches("sha256:");
+    // Both owned backends resolve the same `config.json` + `model.safetensors`
+    // layout from this root, keyed by digest, so metal's existing populated
+    // packages are reused rather than re-copied for a cuda row.
     let packages_root = model_cache.root().join("owned-metal-models");
     let package_root = packages_root.join(package_key);
     if package_root.join("config.json").is_file()
@@ -5339,21 +5387,20 @@ fn assemble_owned_model_package(
     {
         return Ok(package_root);
     }
-    fs::create_dir_all(&packages_root).map_err(|error| {
-        io_to_load_error("create owned-metal package root", &packages_root, &error)
-    })?;
+    fs::create_dir_all(&packages_root)
+        .map_err(|error| io_to_load_error("create owned package root", &packages_root, &error))?;
     let temporary = packages_root.join(format!(".{package_key}.{}.tmp", std::process::id()));
     if temporary.exists() {
         fs::remove_dir_all(&temporary).map_err(|error| {
-            io_to_load_error("remove stale owned-metal package temp", &temporary, &error)
+            io_to_load_error("remove stale owned package temp", &temporary, &error)
         })?;
     }
     fs::create_dir_all(&temporary)
-        .map_err(|error| io_to_load_error("create owned-metal package temp", &temporary, &error))?;
+        .map_err(|error| io_to_load_error("create owned package temp", &temporary, &error))?;
     fs::copy(model_path, temporary.join("model.safetensors"))
-        .map_err(|error| io_to_load_error("copy owned-metal model", model_path, &error))?;
+        .map_err(|error| io_to_load_error("copy owned model", model_path, &error))?;
     fs::copy(&config.path, temporary.join("config.json"))
-        .map_err(|error| io_to_load_error("copy owned-metal config", &config.path, &error))?;
+        .map_err(|error| io_to_load_error("copy owned config", &config.path, &error))?;
     match fs::rename(&temporary, &package_root) {
         Ok(()) => {}
         Err(_) if package_root.is_dir() => {
@@ -5361,7 +5408,7 @@ fn assemble_owned_model_package(
         }
         Err(error) => {
             return Err(io_to_load_error(
-                "publish owned-metal model package",
+                "publish owned model package",
                 &package_root,
                 &error,
             ))
@@ -6293,6 +6340,61 @@ fn model_load_scratch_path(job_id: &str) -> PathBuf {
     ))
 }
 
+fn model_load_owned_profile(
+    engine: &str,
+    root: &Path,
+    params: &ModelLoadParams,
+    config: Option<&ModelCacheMeta>,
+    extra: &[ModelCacheMeta],
+) -> Result<Option<OwnedCatalogConfig>, WireOperationError> {
+    if engine != "owned-metal" && engine != CUDA_WORKER_ENGINE {
+        return Ok(None);
+    }
+    let config = config.ok_or_else(|| {
+        artifact_invalid_error(format!("{engine} model.load requires files.config"))
+    })?;
+    let locator = Some(ModelAssetLocator::CacheDigest {
+        digest: config.digest.clone(),
+    });
+    let extras = extra
+        .iter()
+        .map(|meta| ModelAssetLocator::CacheDigest {
+            digest: meta.digest.clone(),
+        })
+        .collect();
+    let profile = if engine == "owned-metal" {
+        owned_catalog_config(
+            root,
+            params.family.as_deref(),
+            params.dtype.as_deref(),
+            params.execution.as_deref(),
+            params.attention_units,
+            locator,
+            extras,
+        )
+    } else {
+        owned_cuda_catalog_config(
+            params.family.as_deref(),
+            params.dtype.as_deref(),
+            params.execution.as_deref(),
+            params.attention_units,
+            OwnedCudaDeclaredIdentity {
+                kernel_revision: None,
+                ptx_virtual_arch: None,
+                minimum_device_cc: None,
+                minimum_cuda_driver_api: None,
+            },
+        )
+        .map(|mut profile| {
+            profile.config_locator = locator;
+            profile.extra_locators = extras;
+            profile
+        })
+    }
+    .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    Ok(Some(profile))
+}
+
 async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params: ModelLoadParams) {
     if !matches!(
         state
@@ -6425,36 +6527,13 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             config_meta.as_ref(),
             &extra_metas,
         );
-        let owned = if engine_name == "owned-metal" {
-            if config_meta.is_none() {
-                return Err(artifact_invalid_error(
-                    "owned-metal model.load requires files.config",
-                ));
-            }
-            Some(
-                owned_catalog_config(
-                    temp_dir,
-                    params.family.as_deref(),
-                    params.dtype.as_deref(),
-                    params.execution.as_deref(),
-                    params.attention_units,
-                    config_meta
-                        .as_ref()
-                        .map(|meta| ModelAssetLocator::CacheDigest {
-                            digest: meta.digest.clone(),
-                        }),
-                    extra_metas
-                        .iter()
-                        .map(|meta| ModelAssetLocator::CacheDigest {
-                            digest: meta.digest.clone(),
-                        })
-                        .collect(),
-                )
-                .map_err(|error| artifact_invalid_error(error.to_string()))?,
-            )
-        } else {
-            None
-        };
+        let owned = model_load_owned_profile(
+            &engine_name,
+            temp_dir,
+            &params,
+            config_meta.as_ref(),
+            &extra_metas,
+        )?;
         let spec = build_loaded_catalog_model(
             &params,
             &engine_name,
@@ -17512,6 +17591,206 @@ mod tests {
         );
         assert_eq!(unloaded_row["device_class"], "cpu");
         assert_eq!(unloaded_row["certified"], false);
+    }
+
+    /// Regresses the native CUDA model.load path: a source=file owned-cuda load
+    /// with family=qwen3/dtype=f16/execution=supervised must persist a complete
+    /// owned profile, survive the restart normalization round-trip, and reach a
+    /// package directory whose config.json the CUDA engine resolves.
+    #[test]
+    fn owned_cuda_model_load_persists_owned_profile_and_assembles_package() {
+        let scratch = std::env::temp_dir().join(format!(
+            "synapse-owned-cuda-load-{}-{}",
+            std::process::id(),
+            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+
+        let model_src = scratch.join("model.safetensors");
+        let tokenizer_src = scratch.join("tokenizer.json");
+        let config_src = scratch.join("config.json");
+        let header = br#"{"embedding.weight":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}"#;
+        let mut model_bytes = (header.len() as u64).to_le_bytes().to_vec();
+        model_bytes.extend_from_slice(header);
+        model_bytes.extend_from_slice(&[0; 4]);
+        std::fs::write(&model_src, &model_bytes).expect("write model");
+        std::fs::write(&tokenizer_src, b"{}").expect("write tokenizer");
+        std::fs::write(&config_src, b"{}").expect("write config");
+        // model.load construction: the same params execute_model_load_job
+        // parses, and the same owned profile it must now build for owned-cuda.
+        // source=file joins the top-level path with each file locator.
+        let params: ModelLoadParams = serde_json::from_value(json!({
+            "source": "file",
+            "path": scratch.to_string_lossy(),
+            "engine": CUDA_WORKER_ENGINE,
+            "task": "embed",
+            "model_id": "native-qwen3-load",
+            "family": "qwen3",
+            "dtype": "f16",
+            "execution": "supervised",
+            "max_tokens": 512,
+            "files": {
+                "model": "model.safetensors",
+                "tokenizer": "tokenizer.json",
+                "config": "config.json"
+            }
+        }))
+        .expect("model.load params must parse");
+        let engine_name = canonical_engine_name(&params.engine);
+        assert_eq!(engine_name, CUDA_WORKER_ENGINE);
+
+        let sources = resolve_model_load_sources(&params).expect("sources must resolve");
+        let model_digest = format!("sha256:{}", sha256_hex(&model_bytes));
+        let tokenizer_digest = format!(
+            "sha256:{}",
+            sha256_hex(&std::fs::read(&tokenizer_src).expect("read tokenizer"))
+        );
+        let config_digest = format!(
+            "sha256:{}",
+            sha256_hex(&std::fs::read(&config_src).expect("read config"))
+        );
+
+        let meta = |digest: String,
+                    source_url: String,
+                    format: String,
+                    tokenizer_digest: Option<String>| ModelCacheMeta {
+            digest,
+            source_url,
+            format,
+            sanitized_tokenizer_digest: tokenizer_digest,
+            validation_state: synapse_core::CacheValidationState::Valid,
+            pins: Vec::new(),
+            tombstone: None,
+        };
+        let model_meta = meta(
+            model_digest.clone(),
+            local_file_url(&model_src),
+            default_artifact_format(&engine_name),
+            Some(tokenizer_digest.clone()),
+        );
+        let tokenizer_meta = meta(
+            tokenizer_digest.clone(),
+            local_file_url(&tokenizer_src),
+            "tokenizer_json".to_string(),
+            None,
+        );
+        let config_meta = meta(
+            config_digest.clone(),
+            local_file_url(&config_src),
+            "json".to_string(),
+            None,
+        );
+
+        let owned_profile =
+            model_load_owned_profile(&engine_name, &scratch, &params, Some(&config_meta), &[])
+                .expect("load profile must build")
+                .expect("CUDA load must retain its profile");
+
+        let package_digest = package_digest(&model_meta, &tokenizer_meta, Some(&config_meta), &[]);
+        let spec = build_loaded_catalog_model(
+            &params,
+            &engine_name,
+            &sources,
+            &model_meta,
+            &tokenizer_meta,
+            package_digest,
+            Vec::new(),
+            Some(owned_profile),
+            &InlineConfig::default(),
+            &JobConfig::default(),
+        )
+        .expect("catalog model must build");
+        // The persisted row is the defect: pre-fix these were all None because
+        // no owned profile reached build_stored_model_config.
+        assert_eq!(spec.engine, CUDA_WORKER_ENGINE);
+        assert_eq!(spec.owned_family.as_deref(), Some("qwen3-0.6b"));
+        assert_eq!(spec.owned_dtype.as_deref(), Some("f16"));
+        assert_eq!(spec.owned_execution.as_deref(), Some("supervised"));
+        assert_eq!(
+            spec.config_locator,
+            Some(ModelAssetLocator::CacheDigest {
+                digest: config_digest.clone()
+            })
+        );
+        assert_eq!(spec.artifact_format, "safetensors-package");
+
+        // Restart round-trip: the stored row is re-read through
+        // normalize_catalog_model and must rehydrate the same owned profile.
+        let restored = normalize_catalog_model(
+            spec.clone(),
+            &InlineConfig::default(),
+            &JobConfig::default(),
+        )
+        .expect("stored row must normalize");
+        assert_eq!(restored.owned_family, spec.owned_family);
+        assert_eq!(restored.owned_dtype, spec.owned_dtype);
+        assert_eq!(restored.config_locator, spec.config_locator);
+        assert_eq!(restored.fingerprint, spec.fingerprint);
+
+        let rehydrated = stored_owned_profile(&restored)
+            .expect("stored owned-cuda profile must rehydrate")
+            .expect("owned-cuda row must yield a profile");
+        assert_eq!(rehydrated.family, OwnedFamily::Qwen3);
+        assert_eq!(rehydrated.dtype, OwnedDType::F16);
+        assert_eq!(rehydrated.execution, "supervised");
+        assert_eq!(
+            rehydrated.config_locator,
+            Some(ModelAssetLocator::CacheDigest {
+                digest: config_digest.clone()
+            })
+        );
+        // Terminal token policy: qwen3 reserves one token, so a 512-token
+        // budget must become 511 through the owned profile.
+        assert_eq!(
+            owned_tokenizer_max_tokens(spec.max_tokens, Some(&rehydrated)),
+            511
+        );
+
+        // The package the CUDA worker loads: assemble from the cache so the
+        // engine sees a directory holding config.json + model.safetensors.
+        let cache_root = scratch.join("cache");
+        std::fs::create_dir_all(cache_root.join("blobs")).expect("create cache blobs");
+        let model_cache = ModelCache::new(&cache_root);
+        std::fs::write(model_cache.blob_path(&model_digest), &model_bytes)
+            .expect("stage model blob");
+        std::fs::write(
+            model_cache.blob_path(&config_digest),
+            &std::fs::read(&config_src).expect("read config"),
+        )
+        .expect("stage config blob");
+        let package = assemble_owned_model_package(
+            &restored,
+            model_cache.blob_path(&model_digest).as_path(),
+            &model_cache,
+            &rehydrated,
+        )
+        .expect("owned-cuda package must assemble");
+        assert!(package.is_dir(), "package must be a directory");
+        assert!(package.join("config.json").is_file());
+        assert!(package.join("model.safetensors").is_file());
+
+        // resolve_model_root is the contract the CUDA engine enforces on the
+        // effective path: a bare file resolves to its parent only when the
+        // parent holds config.json, which the assembled package guarantees.
+        let runtime_config = model_runtime_config(
+            &restored,
+            &package,
+            &[],
+            model_cache.root(),
+            DEFAULT_MICROLLM_MAX_TOKENS,
+            None,
+        );
+        assert_eq!(
+            runtime_config.values["model_path"],
+            package.to_string_lossy()
+        );
+        assert_eq!(runtime_config.values["backend"], "cuda-ptx");
+        assert_eq!(
+            runtime_config.values["ptx_virtual_arch"],
+            OWNED_CUDA_PTX_VIRTUAL_ARCH
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]
