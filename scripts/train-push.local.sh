@@ -12,7 +12,15 @@ bash scripts/check-train-preconditions.sh || refuse "train preconditions failed 
 # seconds; a cold build is slower and still cheaper than shipping it unbuilt.
 # Delete this block the day a Mac runner rejoins CI, not before.
 if [ "$(uname -s)" = "Darwin" ]; then
-  mac_crates="-p synapse-engine-owned -p synapse-worker-ane -p synapse-worker-mlx"
+  # synapse-worker-mlx is deliberately absent. It is the frozen Lane-1
+  # reference engine, already out of the release set, and its pinned
+  # mlx-sys 0.2.0 no longer compiles under the Metal toolchain that macOS
+  # 26A428 installed (v27.1.266): MLX's own steel/gemm/mma.h fails at
+  # frag_at with "reference to type 'thread vec<...>' could not bind to an
+  # lvalue", 114 errors, in code we do not own. Every train would refuse on
+  # a lane nothing ships. It comes back here only with an mlx-sys that
+  # builds on the current toolchain, or leaves the workspace.
+  mac_crates="-p synapse-engine-owned -p synapse-worker-ane"
   # The Metal toolchain lives in full Xcode; Command Line Tools alone cannot
   # compile the shaders, and the failure is a confusing linker error rather
   # than a missing-tool message.
