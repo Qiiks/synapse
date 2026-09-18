@@ -3372,16 +3372,14 @@ fn first_snapshot_with(snapshots: &Path, file_name: &str) -> Option<PathBuf> {
         .find(|path| path.join(file_name).exists())
 }
 
+/// Serialises the MiniLM e2e tests across every test process on the box.
+/// The handle is an OS advisory lock (flock on unix, LockFileEx on Windows)
+/// through the same lease store the module uses for its singleton lease, so
+/// a holder that is killed mid-test releases it in the kernel: there is no
+/// stale-file case for a later waiter to diagnose by hand.
 struct MinilmE2eLock {
-    path: PathBuf,
     #[allow(dead_code)]
-    file: std::fs::File,
-}
-
-impl Drop for MinilmE2eLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+    handle: Box<dyn cortexkit_lease::LeaseHandle>,
 }
 
 #[tokio::test]
@@ -3931,52 +3929,33 @@ fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_lite
     );
 }
 
-/// How long to wait for another test process to release the MiniLM fixture
-/// lock before concluding its holder is gone. The longest legitimate hold is
-/// one e2e test's daemon lifetime, comfortably under a minute.
-const MINILM_E2E_LOCK_WAIT: Duration = Duration::from_secs(180);
+/// Upper bound on waiting for a LIVE holder. Twenty-two tests queue on this
+/// lock and each holds it for one daemon lifetime, so on a loaded shared
+/// workstation the last waiter can legitimately sit here for many minutes;
+/// a 180 s bound calibrated on a single test failed thirteen of them at
+/// once. Since a dead holder releases the lock in the kernel, the only thing
+/// this bound catches is a holder that is alive and hung, which is a defect
+/// worth a named failure rather than a silent CI timeout.
+const MINILM_E2E_LOCK_WAIT: Duration = Duration::from_secs(1800);
 
 fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
-    let path = std::env::temp_dir().join("synapse-minilm-e2e.lock");
-    // Bounded, because the previous unbounded loop turned a stale lock into an
-    // unkillable test run: a cancelled or killed holder leaves the file behind,
-    // its Drop never runs, and every later MiniLM test spins here forever
-    // waiting for a process that no longer exists. That is indistinguishable
-    // from a hung test until someone finds the file by hand — it cost a 900s
-    // run and two worker timeouts before it was diagnosed.
+    use cortexkit_lease::{FileLeaseStore, LeaseError, LeaseKey, LeaseStore};
+    let store = FileLeaseStore::new(std::env::temp_dir());
+    let key = LeaseKey::new("synapse", "e2e", "minilm-fixture");
     let deadline = Instant::now() + MINILM_E2E_LOCK_WAIT;
     loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => return MinilmE2eLock { path, file },
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        match store.acquire(&key) {
+            Ok(handle) => return MinilmE2eLock { handle },
+            Err(LeaseError::Held { .. }) => {
                 assert!(
                     Instant::now() < deadline,
-                    "MiniLM e2e fixture lock at {} was held for over {}s. If no other \
-                     test is running, a previous run was killed before releasing it; \
-                     delete the file to recover.",
-                    path.display(),
+                    "MiniLM e2e fixture lease {key:?} was held by a live process for over \
+                     {}s; a holder that stays alive this long is hung, not queued",
                     MINILM_E2E_LOCK_WAIT.as_secs()
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // Windows keeps a deleted-but-still-open file in a delete-pending
-            // state, and creating that name meanwhile fails with access denied
-            // rather than already-exists. That is the holder releasing the
-            // lock, so it is the same transient condition as a held lock.
-            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => {
-                assert!(
-                    Instant::now() < deadline,
-                    "MiniLM e2e fixture lock at {} stayed delete-pending for over {}s",
-                    path.display(),
-                    MINILM_E2E_LOCK_WAIT.as_secs()
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) => panic!("failed to acquire MiniLM e2e lock: {error}"),
+            Err(LeaseError::Io(error)) => panic!("failed to acquire MiniLM e2e lease: {error}"),
         }
     }
 }
