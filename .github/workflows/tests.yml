@@ -339,8 +339,12 @@ jobs:
           # the pipeline reads FALSE exactly when the needle is present — the
           # guard would pass on the one output it exists to catch. A here-string
           # has no writer to signal. The exit code is captured and stated, not
-          # branched on blind, so an unexpected code fails loudly too.
-          grep -q "skipping" <<<"$out"; skip_rc=$?
+          # branched on blind, so an unexpected code fails loudly too. The
+          # `|| skip_rc=$?` form is load-bearing: this shell also runs with
+          # errexit, which would abort the step on grep's exit 1 (needle
+          # absent, the green case) before the code was ever read.
+          skip_rc=0
+          grep -q "skipping" <<<"$out" || skip_rc=$?
           case "$skip_rc" in
             0)
               grep "skipping" <<<"$out"
