@@ -57,11 +57,10 @@ impl SubcVaultCredentialClient {
                 RouteTarget::ManagementSurface {
                     module_id: CREDENTIALS_MODULE_ID.to_string(),
                 },
-                BindIdentity {
-                    project_root: PathBuf::from("/"),
-                    harness: "synapse".to_string(),
-                    session: "remote-gateway-v1".to_string(),
-                },
+                // No project_id: synapse produces none, and the type's doc
+                // comment warns that alternating Some/None across binds silently
+                // forks a consumer's lineage. Absent is the safe side.
+                BindIdentity::new(PathBuf::from("/"), "synapse", "remote-gateway-v1"),
                 body.clone(),
                 options.clone(),
             )

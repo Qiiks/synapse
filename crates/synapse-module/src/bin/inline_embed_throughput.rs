@@ -53,11 +53,11 @@ async fn main() -> Result<()> {
     let consumer = SubcConsumer::connect(&subc, ConsumerOptions::default())
         .await
         .with_context(|| format!("connect to subc through {}", subc.display()))?;
-    let identity = BindIdentity {
-        project_root: env::current_dir().context("find exerciser project root")?,
-        harness: "inline-embed-throughput".to_string(),
-        session: format!("inline-embed-throughput-{}", std::process::id()),
-    };
+    let identity = BindIdentity::new(
+        env::current_dir().context("find exerciser project root")?,
+        "inline-embed-throughput",
+        format!("inline-embed-throughput-{}", std::process::id()),
+    );
     let nonce = format!(
         "{}-{}",
         SystemTime::now()

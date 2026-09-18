@@ -174,16 +174,12 @@ where
 {
     let project_root = cwd().context("resolve cwd")?;
     match identity_override {
-        Some((harness, session)) => Ok(BindIdentity {
+        Some((harness, session)) => Ok(BindIdentity::new(project_root, harness, session)),
+        None => Ok(BindIdentity::new(
             project_root,
-            harness,
-            session,
-        }),
-        None => Ok(BindIdentity {
-            project_root,
-            harness: "subc-call".to_string(),
-            session: format!("subc-call-{}", pid()),
-        }),
+            "subc-call",
+            format!("subc-call-{}", pid()),
+        )),
     }
 }
 

@@ -130,11 +130,11 @@ pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) 
             module_id: MODULE_ID.to_string(),
         };
         let bind_id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let identity = BindIdentity {
-            project_root: project_root.to_path_buf(),
-            harness: format!("synapse-e2e-{}-{bind_id}", process::id()),
-            session: format!("session-{}-{bind_id}", process::id()),
-        };
+        let identity = BindIdentity::new(
+            project_root.to_path_buf(),
+            format!("synapse-e2e-{}-{bind_id}", process::id()),
+            format!("session-{}-{bind_id}", process::id()),
+        );
         let frame = control_rpc(
             stream,
             corr + attempt,

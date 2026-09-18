@@ -223,11 +223,11 @@ async fn run(cli: Cli) -> Result<()> {
     let consumer = SubcConsumer::connect(&subc, ConsumerOptions::default())
         .await
         .with_context(|| format!("connect to subc through {}", subc.display()))?;
-    let identity = BindIdentity {
+    let identity = BindIdentity::new(
         project_root,
-        harness: "opctl".to_string(),
-        session: format!("opctl-{}", std::process::id()),
-    };
+        "opctl",
+        format!("opctl-{}", std::process::id()),
+    );
 
     let result = execute(&consumer, &identity, &cli.command).await;
     consumer.close().await;
