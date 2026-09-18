@@ -333,11 +333,26 @@ jobs:
             profile="--release"
           fi
           out=$(cargo nextest run -p synapse-module --test skeleton_e2e $profile --retries 0 --no-capture 2>&1 || true)
-          if echo "$out" | grep -q "skipping"; then
-            echo "$out" | grep "skipping"
-            echo "::error::fixture e2e silently skipped — fixture staging is broken on this runner"
-            exit 1
-          fi
+          # Not `echo "$out" | grep -q`: this shell runs with pipefail, grep -q
+          # closes the pipe on its first match, and a producer still writing a
+          # multi-megabyte nextest transcript then dies with SIGPIPE (141), so
+          # the pipeline reads FALSE exactly when the needle is present — the
+          # guard would pass on the one output it exists to catch. A here-string
+          # has no writer to signal. The exit code is captured and stated, not
+          # branched on blind, so an unexpected code fails loudly too.
+          grep -q "skipping" <<<"$out"; skip_rc=$?
+          case "$skip_rc" in
+            0)
+              grep "skipping" <<<"$out"
+              echo "::error::fixture e2e silently skipped — fixture staging is broken on this runner"
+              exit 1
+              ;;
+            1) ;;
+            *)
+              echo "::error::skip guard could not read the nextest output (grep exit $skip_rc)"
+              exit 1
+              ;;
+          esac
 
       # When a self-hosted `macos-metal` runner returns, restore the
       # checkpoint-gated owned-decode battery steps for that lane: build
