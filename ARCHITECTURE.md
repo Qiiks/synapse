@@ -17,9 +17,9 @@
 ## Layers
 
 **Synapse SubC Module (`synapse-module`):**
-- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), approval storage and identity-based rollback (`rollback.rs`), runtime admission probe health, certification metric publishing and persistent staleness tracking (`certification_stale_since_ms`), storage epochs and rotation ledgers, owned CUDA evidence and declared identities, full per-lane capability reporting on `models.list`, dual-hash embed divergence verification (`submitted_sha256` alongside `content_sha256`), and in-process execution via the owned engine.
+- Purpose: The main service listening on the SubC bus. Handles route binding, job admission, the model cache, remote provider dispatch, worker lifecycle supervision (offloading worker engine drops to dedicated threads), approval storage and identity-based rollback (`rollback.rs`), runtime admission probe health, certification metric publishing and persistent staleness tracking (`certification_stale_since_ms`), storage epochs and rotation ledgers, owned CUDA evidence from the isolated per-worker floor probe and declared identities, persisted and restart-restored native owned profiles with cache-assembled model packages, full per-lane capability reporting on `models.list`, dual-hash embed divergence verification (`submitted_sha256` alongside `content_sha256`), and in-process execution via the owned engine.
 - Location: `crates/synapse-module`
-- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic and separate serving admission gates, admission telemetry counters (`refusals`, `jobs_minted`), socket/pipe-based worker host, the remote gateway client, module-side routing (`crates/synapse-module/owned-decode-routing` including ANE split prefill routing `crates/synapse-module/owned-decode-routing/ane_prefill.rs`), grammar compilation and DECODE scheduler (`crates/synapse-module/owned-decode-grammar-scheduler`), certification gates and probes (`crates/synapse-module/owned-decode-certification`), approval rollback (`rollback.rs`), contract manifests (`crates/synapse-module/owned-decode-manifests`), request-scoped semantic-sidecar hint bank normalization and per-field slotting (`crates/synapse-module/owned-decode-sidecar`), model catalog descriptors publishing per-row ceilings `max_tokens` with source provenance `max_tokens_source`, discrete `bucket_ladder` envelopes, output dimensions, dtypes, device classes, and warm-load hints, stable digest-keyed CoreML artifact materialization (`crates/synapse-module/src/ane_artifact.rs`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
+- Contains: A 3-class aging scheduler, SQLite durable job and cache lease state, machine probe certification logic and separate serving admission gates, admission telemetry counters (`refusals`, `jobs_minted` paired with terminal `jobs_completed`/`jobs_failed`/`jobs_inherited` and derived `jobs_open` with startup orphan reconciliation), socket/pipe-based worker host with beside-the-module sibling binary resolution (`worker_binary_file_name` in `crates/synapse-core/src/worker_engine_names.rs`), the remote gateway client, module-side routing (`crates/synapse-module/owned-decode-routing` including ANE split prefill routing `crates/synapse-module/owned-decode-routing/ane_prefill.rs`), grammar compilation and DECODE scheduler (`crates/synapse-module/owned-decode-grammar-scheduler`), certification gates and probes (`crates/synapse-module/owned-decode-certification`), checked-in embed probe corpus fixtures covering every owned family (`crates/synapse-module/src/fixtures/probe_corpus_qwen3_embedding_fp32.json`), approval rollback (`rollback.rs`), contract manifests (`crates/synapse-module/owned-decode-manifests`), request-scoped semantic-sidecar hint bank normalization and per-field slotting (`crates/synapse-module/owned-decode-sidecar`), model catalog descriptors publishing per-row ceilings `max_tokens` with source provenance `max_tokens_source`, discrete `bucket_ladder` envelopes, output dimensions, dtypes, device classes, and warm-load hints, stable digest-keyed CoreML artifact materialization (`crates/synapse-module/src/ane_artifact.rs`), and direct bindings to `synapse-engine-owned` and `synapse-engine-cuda`.
 - Depends on: `synapse-core`, `synapse-engine-owned`, `synapse-engine-cuda`, `subc-client-rs`, `rusqlite`, `tokio`.
 
 **Remote Gateway (`crates/synapse-module/src/remote`):**
@@ -38,7 +38,7 @@
 **Synapse CUDA Engine (`synapse-engine-cuda`):**
 - Purpose: Primary in-process CUDA execution engine (`owned-cuda-v1`), providing PTX virtual arch `compute_75` (Compute Capability 7.5+ floor, CUDA Driver API 12.040+) inference for MiniLM, GTE-ModernBERT, and Qwen3 models in f16 storage dtype.
 - Location: `crates/synapse-engine-cuda`
-- Contains: C++/CUDA PTX kernel ports (byte-identical to `unified-rt`), CUDA graphs support, precision-aware embedding execution (`OwnedCudaEmbedEngine`), model family detection (`config.json`), and hardware capability floor verification (`device_meets_floor`).
+- Contains: C++/CUDA PTX kernel ports (byte-identical to `unified-rt`), CUDA graphs support, precision-aware embedding execution (`OwnedCudaEmbedEngine`), model family detection (`config.json`), upload-once device-resident Qwen3 weights with on-device token-ID embedding gather (`embed_gather` in `crates/synapse-engine-cuda/src/port/cuda_qwen3.cu`, host f32 weights freed after upload with the layer count remembered across forwards), a 2-entry LRU shape-plan cache with evict-before-allocate (`max_plans = 2`), streaming SHA-256 digest verification, raw hardware floor readings (`HardwareFloorProbe`), Windows delay-loaded cuBLASLt with explicit library preloading (`ensure_libraries_loaded`), and hardware capability floor verification (`device_meets_floor`).
 - Depends on: `synapse-core`, `safetensors`, `half`, `sha2`, CUDA toolkit/driver libraries.
 - Used by: `synapse-module` and `synapse-worker-cuda`.
 
@@ -52,7 +52,7 @@
 **Synapse Worker Lanes (`synapse-worker-*`):**
 - Purpose: Execute in-memory tokenization, tensor forward passes, and token generation for specific hardware classes (Apple Silicon MLX, Apple Neural Engine, Llama GGUF, NVIDIA CUDA, and supervised Metal decode).
 - Location: `crates/synapse-worker-mlx`, `crates/synapse-worker-ane`, `crates/synapse-worker-llama`, `crates/synapse-worker-cuda`, `crates/synapse-worker-decode`, `workers/ane-prefill-sidecar`
-- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier via `ane-coreml-worker`), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC, supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing and sidecar hint bank installation, and supervised Swift ANE prefill sidecar (`ane-prefill-sidecar`) executing fixed-window CoreML prefill passes. Worker processes disclose their discrete sequence bucket ladders (or `None` for continuous lanes) back to the host via `WorkerResponse::Loaded` and `WorkerResponse::Pong`.
+- Contains: Metal-accelerated customized MLX models, CoreML graphs (including the `gte-modernbert` embedder and reranker for the ANE quiet-tier via `ane-coreml-worker`), `llama.cpp` inference processes, supervised owned CUDA runner (`ck-synapse-worker-cuda`) executing MiniLM, ModernBERT, and Qwen3 embedding batches over IPC and reporting raw driver-API and compute-capability floor readings through the short-lived `--probe-floor` subprocess probe, supervised owned Metal decode runner (`ck-synapse-worker-decode`) executing Qwen3 and LFM2 token generation under progress/continuation framing and sidecar hint bank installation, and supervised Swift ANE prefill sidecar (`ane-prefill-sidecar`) executing fixed-window CoreML prefill passes. Worker processes disclose their discrete sequence bucket ladders (or `None` for continuous lanes) back to the host via `WorkerResponse::Loaded` and `WorkerResponse::Pong`.
 - Depends on: `synapse-core`, `owned-decode-worker`, `synapse-engine-owned`, `mlx-rs`, `coreml` (via Swift), `reqwest`.
 - Used by: The `synapse-module` host spawning them dynamically based on user requests and capability tiers.
 
@@ -137,12 +137,12 @@
 
 **Production Inference Flow:**
 
-1. Initialize layered configuration from `SYNAPSE_CONFIG_PATH` or the platform user path (`$XDG_CONFIG_HOME/cortexkit/synapse.jsonc`, with Windows and HOME fallbacks), merging `.cortexkit/synapse.jsonc`, rejecting unknown fields, and applying `microllm` ceilings — `crates/synapse-module/src/lib.rs`
+1. Initialize layered configuration from `SYNAPSE_CONFIG_PATH` or the platform user path (`$XDG_CONFIG_HOME/cortexkit/synapse.jsonc`, with Windows and HOME fallbacks, refusing relative config-home roots), merging `.cortexkit/synapse.jsonc`, rejecting unknown fields, and applying `microllm` ceilings — `crates/synapse-module/src/lib.rs`
 2. Route request received via SubC — `crates/synapse-module/src/lib.rs`
 3. Validate alias surfaces, apply machine capability profiles with `ane_subtype` chip identity (Perf/Quiet tiers), verify microLLM certifications (refusing execution on uncertified fingerprints), or map user-tier `remote_providers` profiles — `crates/synapse-module/src/store.rs`
-4. Admit job to the DB (checking active attempt ID CAS, request-digest idempotency, and page counts of existing results to resume from checkpoints), recording admission telemetry (`jobs_minted` on admission, `refusals` with stable reason codes on rejection) — `crates/synapse-module/src/lib.rs` / `crates/synapse-module/src/store.rs`
+4. Admit job to the DB (checking active attempt ID CAS, request-digest idempotency, and page counts of existing results to resume from checkpoints), recording admission telemetry (`jobs_minted` on admission paired with terminal `jobs_completed`/`jobs_failed`/`jobs_inherited` and derived `jobs_open`, `refusals` with stable reason codes on rejection) and reconciling startup orphans into `jobs_inherited` — `crates/synapse-module/src/lib.rs` / `crates/synapse-module/src/store.rs`
 5. Dispatch based on route:
-   - **Local:** Download/Verify models through content-addressed cache with shared leases and 24-hour age-floored temporary blob cleanup, materialize archived CoreML artifacts once at digest-keyed stable paths (`ane_artifact.rs`), admit to 3-class Aging Scheduler, spawn/handshake Worker lane (UNIX sockets / Windows pipes), submit binary frames.
+   - **Local:** Download/Verify models through content-addressed cache with shared leases and 24-hour age-floored temporary blob cleanup, materialize archived CoreML artifacts once at digest-keyed stable paths (`ane_artifact.rs`), admit to 3-class Aging Scheduler, verify the CUDA hardware floor through the isolated per-worker `--probe-floor` subprocess before spawning the CUDA worker, resolve the worker binary beside the module binary when no explicit path is set, spawn/handshake Worker lane (UNIX sockets / Windows pipes), submit binary frames.
    - **Remote:** Forward through `ProviderRuntime` pools, passing circuit breakers and p90 estimators, fetching credentials via vault client with class-based error disposition (`transient`/`auth_required` pausing jobs, `permanent`/`context_overflow` rejecting with `credential_config_invalid`), executing strict loopback-validated HTTP calls, and serializing `recommended_batch` policies in model listings — `crates/synapse-module/src/remote/runtime.rs`
 6. Commit checkpointed pages sequentially according to byte size limits (`result_page_bytes`) as the job runs (allowing page-while-running for snapshots and continuity hooks), mark job complete (applying execution/retention TTL split), and return envelope. If the client queries a job, they can follow pages via `page` parameters — `crates/synapse-module/src/store.rs`. On embedding routes (`embed.query`, `embed.batch`), each output item echoes both `content_sha256` (hash of actually embedded tokens post-truncation) and `submitted_sha256` (hash of raw submitted text before tokenization or truncation). Model discovery on `models.list` serializes per-lane capability descriptors including `max_tokens` (enforced per-row ceiling), `max_tokens_source` (`worker_bucket`, `runtime_bucket`, `catalog_unloaded`, `catalog`), `bucket_ladder` (accepted sequence lengths), `dims`, `dtype`, `device_class`, `certified`, and `warm_load_cost_hint_ms` — `crates/synapse-module/src/lib.rs`.
 
@@ -228,7 +228,7 @@
 - Pattern: Trait-based State Machine Interface.
 
 **Content-Addressed Lease Cache:**
-- Purpose: Safe and crash-resilient model storage using atomic file renaming and reference-counted shared leases preventing active models from two-phase garbage collection. Materialize archived CoreML bundles once at digest-keyed stable paths so CoreML specialization caches hit across worker restarts instead of re-paying compilation per temp extraction.
+- Purpose: Safe and crash-resilient model storage using atomic file renaming and reference-counted shared leases preventing active models from two-phase garbage collection. Materialize archived CoreML bundles once at digest-keyed stable paths so CoreML specialization caches hit across worker restarts instead of re-paying compilation per temp extraction. Report a held digest lease as transient/retryable, never invalid; acquire the digest lease on `pin`; validate tokenizer payloads before publishing blobs.
 - Location: `crates/synapse-module/src/store.rs`, `crates/synapse-module/src/ane_artifact.rs`
 - Pattern: Persistent DB Leasing.
 
@@ -323,7 +323,7 @@
 - Pattern: SQLite-backed schema with automatic demotion upon failed re-certification and non-probing health metric projection.
 
 **Admission Telemetry & Decoupled Serving Gates:**
-- Purpose: Separates probe certification (`certified`, `uncertified`, `not_required`) from approval-backed serving admission (`serving_admission`: `enabled`, `disabled`) independent of lazy worker residency, tracking runtime admission telemetry (`jobs_minted`, `refusals` counts and timestamps).
+- Purpose: Separates probe certification (`certified`, `uncertified`, `not_required`) from approval-backed serving admission (`serving_admission`: `enabled`, `disabled`) independent of lazy worker residency, tracking runtime admission telemetry (`jobs_minted` with terminal `jobs_completed`/`jobs_failed`/`jobs_inherited`, derived `jobs_open`, and `refusals` counts and timestamps).
 - Location: `crates/synapse-module/src/lib.rs`
 - Pattern: In-memory atomic telemetry aggregation and decoupled admission gate evaluation.
 
@@ -348,9 +348,9 @@
 - Pattern: Direct Metal Compute Kernel Pipeline with Rolling Conv-Cache.
 
 **OwnedCudaEmbedEngine & Worker:**
-- Purpose: Execute CUDA PTX embedding inference for MiniLM, ModernBERT, and Qwen3 in f16 storage dtype across in-process and supervised out-of-process worker configurations.
+- Purpose: Execute CUDA PTX embedding inference for MiniLM, ModernBERT, and Qwen3 in f16 storage dtype across in-process and supervised out-of-process worker configurations, uploading weights once into device residency and gathering embeddings on device from token IDs.
 - Location: `crates/synapse-engine-cuda/src/lib.rs`, `crates/synapse-worker-cuda/src/main.rs`
-- Pattern: PTX Kernel Dispatch with CUDA Graph Execution and Hardware Capability Floor (`device_meets_floor`).
+- Pattern: PTX Kernel Dispatch with CUDA Graph Execution, Upload-Once Device Residency, 2-Entry LRU Shape-Plan Cache, and Hardware Capability Floor (`device_meets_floor` over raw `HardwareFloorProbe` readings from the worker `--probe-floor` subprocess).
 
 **OrtEmbedEngine:**
 - Purpose: Universal in-process ONNX Runtime execution engine providing portable CPU embedding inference with configurable pooling, thread scaling, and digest validation.
@@ -363,9 +363,9 @@
 - Pattern: Identity-Based Approval Ledger with Atomic Rollback Transaction.
 
 **Worker HELLO Engine Names:**
-- Purpose: Centralized canonical worker identity constants preventing identity drift during worker handshakes.
+- Purpose: Centralized canonical worker identity constants preventing identity drift during worker handshakes, plus sibling binary file names (`worker_binary_file_name`) resolving workers beside the module binary.
 - Location: `crates/synapse-core/src/worker_engine_names.rs`
-- Pattern: Shared Identity Constants (`LLAMA_WORKER_ENGINE`, `DECODE_WORKER_ENGINE`, `CUDA_WORKER_ENGINE`, etc.).
+- Pattern: Shared Identity Constants (`LLAMA_WORKER_ENGINE`, `DECODE_WORKER_ENGINE`, `CUDA_WORKER_ENGINE`, etc.) with Sibling Binary Resolution.
 
 **ANE Prefill Router & Split Arm Health:**
 - Purpose: Pure routing boundary selecting certified fixed-window CoreML prefill arms (`W128`, `W256`, `W512`), deriving attempt budgets from p95 calibration, managing consecutive-strike quarantine health (`SplitArmHealth`), and mapping closed bypass (`PrefillBypassReason`) and fallback (`PrefillFallbackReason`) provenance.
